@@ -1,0 +1,8 @@
+.env
+*.state.json
+.cc-telegram-bot.state.json
+__pycache__/
+*.pyc
+.venv/
+*.log
+oracle-launch-retry.sh
