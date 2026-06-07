@@ -68,6 +68,18 @@ MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "40"))
 # colori icona topic ammessi da Telegram (createForumTopic icon_color)
 TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
 
+# Coda publish: file json depositati da `claude-publish` (Mac, via SSH).
+PUBLISH_DIR = Path(os.path.expanduser(os.environ.get("PUBLISH_DIR", "~/.cc-telegram-bot.publish")))
+# Manifest Syncthing (sintassi .stignore): sessioni da sincronizzare Mac<->lgcloud.
+MANIFEST = PROJECTS_DIR / "shared-includes"
+# Path remap: il bot deve lanciare claude con cwd canonico (/Users/...) anche su
+# lgcloud (/home/luigi), così l'encoded dir ~/.claude/projects/<enc> combacia col Mac
+# e le sessioni sono portabili. Su lgcloud: CC_REMAP_FROM=/home/luigi CC_REMAP_TO=/Users/luigilotito
+REMAP_FROM = os.environ.get("CC_REMAP_FROM", "")
+REMAP_TO = os.environ.get("CC_REMAP_TO", "")
+# Long-poll piu corto se c'e' la coda publish, così i publish vengono raccolti in fretta.
+POLL_TIMEOUT = int(os.environ.get("CC_POLL_TIMEOUT", "20"))
+
 LOCK_FILE = Path(os.path.expanduser("~/.cc-telegram-bot.lock"))
 
 BOT_PY_PATH = Path(__file__).resolve()
@@ -585,6 +597,121 @@ def nice_name(cwd: str) -> str:
     return os.path.basename(cwd.rstrip("/")) or cwd
 
 
+def normalize_cwd(cwd: str) -> str:
+    """Rimappa il prefisso home locale a quello canonico (/Users/luigilotito).
+
+    Su lgcloud (home /home/luigi) il bot deve lanciare claude con cwd /Users/...
+    così l'encoded dir di ~/.claude/projects combacia col Mac e la sessione è
+    portabile (richiede bind mount /home/luigi -> /Users/luigilotito).
+    No-op sul Mac (REMAP_FROM vuoto).
+    """
+    if REMAP_FROM and REMAP_TO and (cwd == REMAP_FROM or cwd.startswith(REMAP_FROM + "/")):
+        return REMAP_TO + cwd[len(REMAP_FROM):]
+    return cwd
+
+
+def _enc_cwd(cwd: str) -> str:
+    """Encoded project dir name: ogni '/' e '.' diventa '-' (come fa Claude Code)."""
+    return _re.sub(r"[/.]", "-", cwd)
+
+
+def manifest_add(cwd: str, sid: str) -> bool:
+    """Aggiunge una sessione al manifest Syncthing (shared-includes), idempotente.
+
+    Scrive due righe .stignore-include (la dir encoded + il file .jsonl) così
+    Syncthing sincronizza solo quella sessione. Ritorna True se ha aggiunto righe.
+    """
+    if not cwd or not sid:
+        return False
+    enc = _enc_cwd(normalize_cwd(cwd))
+    needed = [f"!/{enc}", f"!/{enc}/{sid}.jsonl"]
+    try:
+        existing = MANIFEST.read_text().splitlines() if MANIFEST.exists() else []
+    except Exception:
+        existing = []
+    have = set(existing)
+    added = False
+    for ln in needed:
+        if ln not in have:
+            existing.append(ln)
+            have.add(ln)
+            added = True
+    if added:
+        try:
+            MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+            MANIFEST.write_text("\n".join(existing) + "\n")
+            log(f"manifest += {enc}/{sid[:8]}")
+        except Exception as e:
+            log(f"manifest_add err: {e}")
+            return False
+    return added
+
+
+def process_publish_queue(state: dict) -> None:
+    """Scansiona PUBLISH_DIR: per ogni richiesta crea+binda un topic forum.
+
+    Richiesta json depositata da `claude-publish` (Mac via SSH): {uuid, cwd, name}.
+    Usa l'unico forum registrato in state["_forums"]. Idempotente per dir_key.
+    """
+    if not PUBLISH_DIR.is_dir():
+        return
+    reqs = sorted(glob.glob(str(PUBLISH_DIR / "*.json")))
+    if not reqs:
+        return
+    forums = state.get("_forums") or {}
+    forum_id = None
+    for cid, reg in forums.items():
+        if reg.get("registered"):
+            forum_id = int(cid)
+            break
+    for rp in reqs:
+        try:
+            req = json.loads(Path(rp).read_text())
+        except Exception:
+            os.remove(rp)
+            continue
+        uuid = req.get("uuid")
+        cwd = normalize_cwd(req.get("cwd") or "")
+        name = req.get("name") or nice_name(cwd)
+        if not uuid or not cwd:
+            os.remove(rp)
+            continue
+        if forum_id is None:
+            for aid in ALLOW:
+                send(aid, f"📤 publish '{name}' in attesa: manda prima un messaggio nel gruppo forum per registrarlo.")
+            return  # lascia la richiesta in coda, riprova al prossimo giro
+        reg = forum_reg(state, forum_id)
+        topics = reg.setdefault("topics", {})
+        dk = _enc_cwd(cwd)
+        if dk in topics and topics[dk].get("thread_id"):
+            tid = topics[dk]["thread_id"]
+            topics[dk]["session_id"] = uuid
+            state.setdefault(f"{forum_id}:{tid}", {})["session_id"] = uuid
+            send(forum_id, f"↻ <b>{_html.escape(name)}</b> ri-pubblicata (sessione {uuid[:8]}).", thread_id=tid)
+        else:
+            color = TOPIC_COLORS[len(topics) % len(TOPIC_COLORS)]
+            tid, err = create_forum_topic(forum_id, f"📂 {name}", icon_color=color)
+            if tid is None:
+                for aid in ALLOW:
+                    send(aid, f"❌ publish '{name}' fallita: {err}\n(il bot deve essere admin del gruppo con permesso Manage Topics)")
+                os.remove(rp)
+                continue
+            topics[dk] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": uuid}
+            cs = state.setdefault(f"{forum_id}:{tid}", {})
+            cs["cwd"] = cwd
+            cs["session_id"] = uuid
+            send(
+                forum_id,
+                f"🧵 <b>{_html.escape(name)}</b>\n"
+                f"cwd: <code>{_html.escape(cwd)}</code>\n"
+                f"sessione: <code>{uuid[:8]}</code>\n\n"
+                f"Scrivi qui per riprendere questa sessione (sincronizzata col Mac).",
+                thread_id=tid,
+            )
+        save_state(state)
+        os.remove(rp)
+
+
 def enumerate_projects() -> list[dict]:
     """Mappa ~/.claude/projects → progetti con cwd valido e sessione più recente.
 
@@ -608,6 +735,7 @@ def enumerate_projects() -> list[dict]:
             cwd = _session_cwd(s)
             if cwd:
                 break
+        cwd = normalize_cwd(cwd or "")
         if not cwd or not os.path.isdir(cwd):
             continue
         latest = sessions[0]
@@ -751,6 +879,7 @@ def run_claude_streaming(
     `on_status(label)` viene chiamato a ogni cambio tool corrente.
     Ritorna (testo_finale, new_session_id, meta).
     """
+    cwd = normalize_cwd(cwd)  # canonicalizza (/home/luigi -> /Users/luigilotito su lgcloud)
     cmd = [
         "claude", "-p", prompt,
         "--output-format", "stream-json",
@@ -962,16 +1091,19 @@ def handle(msg: dict, state: dict) -> None:
     thread_id = msg.get("message_thread_id")
     skey = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
 
-    # Registrazione forum + auto-sync alla prima interazione nel gruppo.
+    # Registrazione forum alla prima interazione nel gruppo (NO auto-create di massa:
+    # i thread nascono da /remote-desktop sul Mac o da sessioni avviate qui).
     if is_forum_msg(msg):
         reg = forum_reg(state, chat_id)
         if not reg.get("registered"):
             reg["registered"] = True
             save_state(state)
-            log(f"forum registrato chat_id={chat_id}, auto-sync")
-            send(chat_id, "👋 Forum registrato. Creo i thread delle sessioni Claude Code…")
-            summary = do_sync(chat_id, state)
-            send(chat_id, summary)
+            log(f"forum registrato chat_id={chat_id}")
+            send(
+                chat_id,
+                "👋 Forum registrato. Pubblica una sessione dal Mac con <code>/remote-desktop</code>, "
+                "oppure scrivi qui per avviarne una nuova. (<code>/sync</code> per mappare i progetti già presenti.)",
+            )
             return
 
     text = msg.get("text", "").strip()
@@ -1216,6 +1348,9 @@ def handle(msg: dict, state: dict) -> None:
     chat_state["session_id"] = new_sid
     chat_state.setdefault("cwd", cwd)
     accumulate_usage(chat_state, meta)
+    # sessione nuova nata qui (Telegram) → aggiungila al manifest Syncthing (sync verso il Mac)
+    if new_sid and new_sid != sid:
+        manifest_add(cwd, new_sid)
     # tieni allineato il mapping topic → sessione corrente
     if thread_id is not None:
         reg = forum_reg(state, chat_id)
@@ -1289,15 +1424,20 @@ def handle_callback(cb: dict, state: dict) -> None:
 
 def main() -> None:
     acquire_singleton_lock()
-    log(f"bot start, allow={ALLOW}, cwd={CWD}, model={MODEL or '(default)'}, pid={os.getpid()}")
+    PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
+    log(f"bot start, allow={ALLOW}, cwd={CWD}, model={MODEL or '(default)'}, remap={REMAP_FROM or '-'}->{REMAP_TO or '-'}, pid={os.getpid()}")
     set_my_commands()
     state = load_state()
     offset = int(state.get("_tg_offset", 0) or 0)
     backoff = 1
     while True:
         try:
-            r = tg_long("getUpdates", timeout=50, offset=offset, **{"allowed_updates": json.dumps(["message", "callback_query"])})
+            r = tg_long("getUpdates", timeout=POLL_TIMEOUT, offset=offset, **{"allowed_updates": json.dumps(["message", "callback_query"])})
             backoff = 1
+            try:
+                process_publish_queue(state)
+            except Exception as e:
+                log(f"publish queue err: {e}")
             for upd in r.get("result", []):
                 offset = upd["update_id"] + 1
                 state["_tg_offset"] = offset
