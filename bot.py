@@ -2,21 +2,33 @@
 """
 cc-telegram-bot — Bridge Telegram → Claude Code headless.
 
-Long-polling bot. Per ogni messaggio da chat_id whitelisted:
-  - exec `claude -p "<msg>" --resume <session_id>` (stato per chat_id)
+Long-polling bot. Per ogni messaggio da utente whitelisted:
+  - exec `claude -p "<msg>" --resume <session_id>` (stato per chat/topic)
   - rimanda output a Telegram (split a 4096 char)
-  - persiste session_id su disco per continuità multi-turno
+  - persiste session_id su disco per continuita multi-turno
+
+Modalita thread (forum supergroup):
+  - se il bot e in un supergruppo con i Topics abilitati, ogni topic e una
+    sessione separata. `message_thread_id` -> stato indipendente (cwd, session).
+  - `/sync` (o il primo messaggio nel gruppo) crea un topic per ogni progetto
+    Claude Code presente sul Mac (dir in ~/.claude/projects con cwd valido).
+  - scrivere in un topic riprende la sessione bound a quel progetto.
+  La chat privata 1:1 resta invariata (nessun thread_id).
 
 Config via env:
   TG_TOKEN           bot token (obbligatorio)
-  TG_ALLOW_CHAT_IDS  csv di chat_id ammessi (obbligatorio)
+  TG_ALLOW_CHAT_IDS  csv di chat_id/user_id ammessi (obbligatorio)
   CC_CWD             working dir per claude (default ~)
   CC_MODEL           model id opzionale (es. claude-opus-4-7)
   CC_TIMEOUT         timeout subprocess in s (default 300)
   STATE_FILE         path stato sessioni (default ~/.cc-telegram-bot.state.json)
+  CC_PROJECTS_DIR    dir sessioni CC (default ~/.claude/projects)
+  SYNC_EXCLUDE       csv di substring dir da escludere dal sync topic
+  MAX_TOPICS         max topic creati per /sync (default 40)
 """
 import atexit
 import fcntl
+import glob
 import json
 import os
 import subprocess
@@ -45,6 +57,16 @@ MODEL_PRESETS = [
 ]
 API = f"https://api.telegram.org/bot{TOKEN}"
 TG_LIMIT = 4000  # leave room for markup overhead
+
+PROJECTS_DIR = Path(os.path.expanduser(os.environ.get("CC_PROJECTS_DIR", "~/.claude/projects")))
+SYNC_EXCLUDE = [
+    x.strip() for x in os.environ.get(
+        "SYNC_EXCLUDE", "claude-mem-observer,CodexBar-ClaudeProbe"
+    ).split(",") if x.strip()
+]
+MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "40"))
+# colori icona topic ammessi da Telegram (createForumTopic icon_color)
+TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
 
 LOCK_FILE = Path(os.path.expanduser("~/.cc-telegram-bot.lock"))
 
@@ -82,6 +104,8 @@ BOT_COMMANDS = [
     {"command": "effort", "description": "Effort level (low|medium|high|xhigh|max)"},
     {"command": "cwd", "description": "Mostra/cambia working directory"},
     {"command": "model", "description": "Mostra/cambia model id"},
+    {"command": "sync", "description": "Crea/aggiorna i thread delle sessioni CC (forum)"},
+    {"command": "threads", "description": "Lista thread sessione mappati (forum)"},
 ]
 
 
@@ -242,7 +266,14 @@ def _strip_html(s: str) -> str:
     return s.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
 
 
-def send(chat_id: int, text: str, parse_mode: str = "HTML") -> int | None:
+def _thread_param(params: dict, thread_id: int | None) -> dict:
+    """Aggiunge message_thread_id ai params solo se siamo in un topic forum."""
+    if thread_id is not None:
+        params["message_thread_id"] = thread_id
+    return params
+
+
+def send(chat_id: int, text: str, parse_mode: str = "HTML", thread_id: int | None = None) -> int | None:
     """Invia messaggio (split safe). Fallback plain text se HTML rotto."""
     if not text:
         return None
@@ -253,6 +284,7 @@ def send(chat_id: int, text: str, parse_mode: str = "HTML") -> int | None:
             params = {"chat_id": chat_id, "text": chunk, "disable_web_page_preview": "true"}
             if parse_mode:
                 params["parse_mode"] = parse_mode
+            _thread_param(params, thread_id)
             r = tg("sendMessage", **params)
             if r.get("ok"):
                 last_id = r["result"]["message_id"]
@@ -262,7 +294,9 @@ def send(chat_id: int, text: str, parse_mode: str = "HTML") -> int | None:
             if parse_mode:
                 plain = _strip_html(chunk)
                 try:
-                    r = tg("sendMessage", chat_id=chat_id, text=plain[:TG_LIMIT], disable_web_page_preview="true")
+                    params = {"chat_id": chat_id, "text": plain[:TG_LIMIT], "disable_web_page_preview": "true"}
+                    _thread_param(params, thread_id)
+                    r = tg("sendMessage", **params)
                     if r.get("ok"):
                         last_id = r["result"]["message_id"]
                 except Exception as e2:
@@ -270,10 +304,12 @@ def send(chat_id: int, text: str, parse_mode: str = "HTML") -> int | None:
     return last_id
 
 
-def send_status(chat_id: int, text: str) -> int | None:
+def send_status(chat_id: int, text: str, thread_id: int | None = None) -> int | None:
     """Invia messaggio plain text (per status updates editabili). Restituisce message_id."""
     try:
-        r = tg("sendMessage", chat_id=chat_id, text=text[:TG_LIMIT], disable_web_page_preview="true")
+        params = {"chat_id": chat_id, "text": text[:TG_LIMIT], "disable_web_page_preview": "true"}
+        _thread_param(params, thread_id)
+        r = tg("sendMessage", **params)
         if r.get("ok"):
             return r["result"]["message_id"]
     except Exception as e:
@@ -297,18 +333,19 @@ def delete_message(chat_id: int, message_id: int) -> None:
         log(f"delete_message err: {e}")
 
 
-def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]]) -> int | None:
+def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]], thread_id: int | None = None) -> int | None:
     """Invia messaggio con inline_keyboard. `keyboard` è array di righe di bottoni
     {text, callback_data}. Niente HTML parse_mode (i bottoni sostituiscono il formatting).
     """
     try:
-        r = tg(
-            "sendMessage",
-            chat_id=chat_id,
-            text=text[:TG_LIMIT],
-            disable_web_page_preview="true",
-            reply_markup=json.dumps({"inline_keyboard": keyboard}),
-        )
+        params = {
+            "chat_id": chat_id,
+            "text": text[:TG_LIMIT],
+            "disable_web_page_preview": "true",
+            "reply_markup": json.dumps({"inline_keyboard": keyboard}),
+        }
+        _thread_param(params, thread_id)
+        r = tg("sendMessage", **params)
         if r.get("ok"):
             return r["result"]["message_id"]
     except Exception as e:
@@ -337,6 +374,28 @@ def answer_callback(callback_id: str, text: str = "", show_alert: bool = False) 
         tg("answerCallbackQuery", callback_query_id=callback_id, text=text[:200], show_alert="true" if show_alert else "false")
     except Exception as e:
         log(f"answer_callback err: {e}")
+
+
+def create_forum_topic(chat_id: int, name: str, icon_color: int | None = None) -> tuple[int | None, str]:
+    """createForumTopic → (message_thread_id, err). Richiede bot admin con can_manage_topics."""
+    try:
+        params = {"chat_id": chat_id, "name": name[:128]}
+        if icon_color is not None:
+            params["icon_color"] = icon_color
+        r = tg("createForumTopic", **params)
+        if r.get("ok"):
+            return r["result"]["message_thread_id"], ""
+        return None, str(r.get("description") or "errore sconosciuto")
+    except Exception as e:
+        msg = str(e)
+        # urllib HTTPError non espone il body json di default; prova a leggerlo
+        body = getattr(e, "read", None)
+        if callable(body):
+            try:
+                msg = json.loads(e.read()).get("description", msg)
+            except Exception:
+                pass
+        return None, msg
 
 
 def build_effort_keyboard(current: str | None) -> list[list[dict]]:
@@ -450,9 +509,11 @@ def fmt_usage(data: dict) -> str:
     return "\n".join(lines)
 
 
-def chat_action(chat_id: int, action: str = "typing") -> None:
+def chat_action(chat_id: int, action: str = "typing", thread_id: int | None = None) -> None:
     try:
-        tg("sendChatAction", chat_id=chat_id, action=action)
+        params = {"chat_id": chat_id, "action": action}
+        _thread_param(params, thread_id)
+        tg("sendChatAction", **params)
     except Exception as e:
         log(f"chat_action err: {e}")
 
@@ -460,15 +521,16 @@ def chat_action(chat_id: int, action: str = "typing") -> None:
 class TypingPinger:
     """Tiene attivo l'indicatore 'sta scrivendo' su Telegram (~5s TTL, ping ogni 4s)."""
 
-    def __init__(self, chat_id: int, interval: float = 4.0):
+    def __init__(self, chat_id: int, interval: float = 4.0, thread_id: int | None = None):
         self.chat_id = chat_id
         self.interval = interval
+        self.thread_id = thread_id
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            chat_action(self.chat_id, "typing")
+            chat_action(self.chat_id, "typing", thread_id=self.thread_id)
             if self._stop.wait(self.interval):
                 break
 
@@ -489,6 +551,161 @@ def set_my_commands() -> None:
         log(f"setMyCommands ok ({len(BOT_COMMANDS)} cmd)")
     except Exception as e:
         log(f"setMyCommands err: {e}")
+
+
+# ---------------------------------------------------------------------------
+# Thread mode: enumerazione progetti CC + mapping topic forum
+# ---------------------------------------------------------------------------
+
+def _session_cwd(path: str) -> str | None:
+    """Estrae il primo `cwd` da un file sessione .jsonl (scan lazy)."""
+    try:
+        with open(path) as fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("cwd"):
+                    return o["cwd"]
+    except Exception:
+        return None
+    return None
+
+
+def nice_name(cwd: str) -> str:
+    """Nome leggibile per il topic a partire dal cwd."""
+    home = os.path.expanduser("~")
+    if cwd in ("/", ""):
+        return "root /"
+    if cwd == home:
+        return "home"
+    if "/worktrees/" in cwd:
+        return f"wt/{os.path.basename(cwd)}"
+    return os.path.basename(cwd.rstrip("/")) or cwd
+
+
+def enumerate_projects() -> list[dict]:
+    """Mappa ~/.claude/projects → progetti con cwd valido e sessione più recente.
+
+    Esclude dir di noise (SYNC_EXCLUDE), dir senza sessioni, cwd non esistenti
+    (es. worktree rimossi). Ordina per attività (mtime ultima sessione) desc.
+    """
+    out: list[dict] = []
+    if not PROJECTS_DIR.is_dir():
+        return out
+    for d in sorted(os.listdir(PROJECTS_DIR)):
+        full = PROJECTS_DIR / d
+        if not full.is_dir():
+            continue
+        if any(x in d for x in SYNC_EXCLUDE):
+            continue
+        sessions = sorted(glob.glob(str(full / "*.jsonl")), key=os.path.getmtime, reverse=True)
+        if not sessions:
+            continue
+        cwd = None
+        for s in sessions:
+            cwd = _session_cwd(s)
+            if cwd:
+                break
+        if not cwd or not os.path.isdir(cwd):
+            continue
+        latest = sessions[0]
+        out.append({
+            "dir_key": d,
+            "cwd": cwd,
+            "name": nice_name(cwd),
+            "latest_sid": os.path.basename(latest)[:-6],
+            "n": len(sessions),
+            "mtime": os.path.getmtime(latest),
+        })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return out
+
+
+def is_forum_msg(msg: dict) -> bool:
+    chat = msg.get("chat") or {}
+    return chat.get("type") in ("group", "supergroup") and bool(chat.get("is_forum"))
+
+
+def forum_reg(state: dict, chat_id: int) -> dict:
+    forums = state.setdefault("_forums", {})
+    return forums.setdefault(str(chat_id), {"registered": False, "topics": {}})
+
+
+def do_sync(chat_id: int, state: dict) -> str:
+    """Crea/aggiorna un topic per ogni progetto CC. Idempotente.
+
+    - Topic già mappato (dir_key noto) → aggiorna solo cwd/name mapping.
+    - Nuovo → createForumTopic + intro nel topic + seed stato runtime.
+    Ritorna un testo riassuntivo per il topic General.
+    """
+    reg = forum_reg(state, chat_id)
+    topics = reg.setdefault("topics", {})
+    projects = enumerate_projects()
+    if not projects:
+        return "⚠️ nessun progetto Claude Code trovato in ~/.claude/projects."
+
+    created, updated, errors = [], [], []
+    color_i = len(topics)
+    for proj in projects[:MAX_TOPICS]:
+        dk = proj["dir_key"]
+        if dk in topics and topics[dk].get("thread_id"):
+            # refresh: aggiorna metadati (non clobbera la sessione di chat attive)
+            topics[dk]["cwd"] = proj["cwd"]
+            topics[dk]["name"] = proj["name"]
+            updated.append(proj["name"])
+            continue
+        color = TOPIC_COLORS[color_i % len(TOPIC_COLORS)]
+        color_i += 1
+        tid, err = create_forum_topic(chat_id, f"📂 {proj['name']}", icon_color=color)
+        if tid is None:
+            errors.append(f"{proj['name']}: {err}")
+            continue
+        topics[dk] = {
+            "thread_id": tid,
+            "cwd": proj["cwd"],
+            "name": proj["name"],
+            "session_id": proj["latest_sid"],
+        }
+        # seed stato runtime del topic così il primo messaggio riprende la sessione
+        skey = f"{chat_id}:{tid}"
+        cs = state.setdefault(skey, {})
+        cs.setdefault("cwd", proj["cwd"])
+        cs.setdefault("session_id", proj["latest_sid"])
+        created.append(proj["name"])
+        # intro nel nuovo topic
+        send(
+            chat_id,
+            f"🧵 <b>{_html.escape(proj['name'])}</b>\n"
+            f"cwd: <code>{_html.escape(proj['cwd'])}</code>\n"
+            f"sessione: <code>{proj['latest_sid'][:8]}</code> ({proj['n']} sessioni nel progetto)\n\n"
+            f"Scrivi qui per riprendere questa sessione Claude Code.",
+            thread_id=tid,
+        )
+
+    save_state(state)
+    lines = [f"🔄 <b>Sync thread completato</b> — {len(topics)} topic mappati."]
+    if created:
+        lines.append(f"✅ creati ({len(created)}): " + ", ".join(created))
+    if updated:
+        lines.append(f"↻ aggiornati ({len(updated)}): " + ", ".join(updated))
+    if errors:
+        lines.append("❌ errori:\n" + "\n".join(f"  • {e}" for e in errors))
+        lines.append("ℹ️ se 'not enough rights': rendi il bot admin con permesso 'Manage Topics'.")
+    return "\n".join(lines)
+
+
+def fmt_threads(state: dict, chat_id: int) -> str:
+    reg = forum_reg(state, chat_id)
+    topics = reg.get("topics") or {}
+    if not topics:
+        return "Nessun thread mappato. Usa /sync in un supergruppo con Topics."
+    lines = [f"🧵 {len(topics)} thread:"]
+    for dk, t in topics.items():
+        sid = (t.get("session_id") or "")[:8]
+        lines.append(f"• {t.get('name')} — sid {sid} — <code>{_html.escape(t.get('cwd',''))}</code>")
+    return "\n".join(lines)
 
 
 def _summarize_tool_input(name: str, inp: dict) -> str:
@@ -731,10 +948,32 @@ def extract_media_paths(msg: dict) -> tuple[list[str], str]:
 
 
 def handle(msg: dict, state: dict) -> None:
-    chat_id = msg["chat"]["id"]
-    if chat_id not in ALLOW:
-        log(f"deny chat_id={chat_id}")
+    chat = msg.get("chat") or {}
+    chat_id = chat["id"]
+    from_id = (msg.get("from") or {}).get("id")
+    # Auth: utente whitelisted (from_id) OPPURE chat privata whitelisted (back-compat).
+    # In un gruppo chat_id è negativo (non in ALLOW) ma from_id = user id di Luigi.
+    if (from_id not in ALLOW) and (chat_id not in ALLOW):
+        log(f"deny chat_id={chat_id} from_id={from_id}")
         return
+
+    # Thread routing: in un topic forum i messaggi portano message_thread_id.
+    # General topic / chat privata → thread_id None → comportamento legacy.
+    thread_id = msg.get("message_thread_id")
+    skey = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
+
+    # Registrazione forum + auto-sync alla prima interazione nel gruppo.
+    if is_forum_msg(msg):
+        reg = forum_reg(state, chat_id)
+        if not reg.get("registered"):
+            reg["registered"] = True
+            save_state(state)
+            log(f"forum registrato chat_id={chat_id}, auto-sync")
+            send(chat_id, "👋 Forum registrato. Creo i thread delle sessioni Claude Code…")
+            summary = do_sync(chat_id, state)
+            send(chat_id, summary)
+            return
+
     text = msg.get("text", "").strip()
     media_paths, caption = extract_media_paths(msg)
     if not text and not media_paths:
@@ -755,32 +994,48 @@ def handle(msg: dict, state: dict) -> None:
             "/effort [low|medium|high|xhigh|max|reset] — effort level\n"
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
+            "/sync — crea/aggiorna i thread delle sessioni CC (forum)\n"
+            "/threads — lista thread mappati (forum)\n"
             "/help — questo messaggio\n\n"
-            "Altro testo = prompt a Claude.",
+            "In un supergruppo con Topics: ogni thread = una sessione CC separata.\n"
+            "Altro testo = prompt a Claude (continua la sessione del thread corrente).",
+            thread_id=thread_id,
         )
         return
+    if text == "/sync":
+        if not is_forum_msg(msg):
+            send(chat_id, "ℹ️ /sync funziona solo in un supergruppo con i Topics abilitati.", thread_id=thread_id)
+            return
+        forum_reg(state, chat_id)["registered"] = True
+        send(chat_id, "🔄 sincronizzo i thread…", thread_id=thread_id)
+        summary = do_sync(chat_id, state)
+        send(chat_id, summary, thread_id=thread_id)
+        return
+    if text == "/threads":
+        send(chat_id, fmt_threads(state, chat_id), thread_id=thread_id)
+        return
     if text == "/new":
-        cs = state.get(str(chat_id), {})
+        cs = state.get(skey, {})
         cs.pop("session_id", None)
         cs.pop("compact_summary", None)
         cs.pop("usage_agg", None)
-        state[str(chat_id)] = cs
+        state[skey] = cs
         save_state(state)
-        send(chat_id, "🆕 sessione resettata")
+        send(chat_id, "🆕 sessione resettata", thread_id=thread_id)
         return
     if text == "/usage":
-        chat_action(chat_id, "typing")
+        chat_action(chat_id, "typing", thread_id=thread_id)
         data = fetch_cc_usage()
         if not data:
-            send(chat_id, "❌ impossibile leggere usage piano (keychain o endpoint non raggiungibili)")
+            send(chat_id, "❌ impossibile leggere usage piano (keychain o endpoint non raggiungibili)", thread_id=thread_id)
             return
-        send(chat_id, fmt_usage(data))
+        send(chat_id, fmt_usage(data), thread_id=thread_id)
         return
     if text == "/compact":
-        cs = state.setdefault(str(chat_id), {})
+        cs = state.setdefault(skey, {})
         sid = cs.get("session_id")
         if not sid:
-            send(chat_id, "⚠️ nessuna sessione da compattare")
+            send(chat_id, "⚠️ nessuna sessione da compattare", thread_id=thread_id)
             return
         cwd = cs.get("cwd", CWD)
         mode = cs.get("mode", DEFAULT_MODE)
@@ -791,16 +1046,16 @@ def handle(msg: dict, state: dict) -> None:
             "Includi: stato attuale, decisioni prese, file modificati o creati, task pending, "
             "contesto tecnico chiave da preservare. Formato: bullet point. Solo il riassunto, niente preamboli."
         )
-        with TypingPinger(chat_id):
+        with TypingPinger(chat_id, thread_id=thread_id):
             summary, _new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, effort=eff)
         accumulate_usage(cs, meta)
         cs["compact_summary"] = summary
         cs.pop("session_id", None)
         save_state(state)
-        send(chat_id, f"🗜 sessione compattata. Riassunto:\n\n{summary}\n\n— prossimo prompt parte da zero con questo contesto.")
+        send(chat_id, f"🗜 sessione compattata. Riassunto:\n\n{summary}\n\n— prossimo prompt parte da zero con questo contesto.", thread_id=thread_id)
         return
     if text == "/status":
-        cs = state.get(str(chat_id), {})
+        cs = state.get(skey, {})
         sid = cs.get("session_id")
         cwd = cs.get("cwd", CWD)
         mode = cs.get("mode", DEFAULT_MODE)
@@ -814,6 +1069,8 @@ def handle(msg: dict, state: dict) -> None:
             f"model: {model or '(default)'}",
             f"effort: {eff or '(default)'}",
         ]
+        if thread_id is not None:
+            lines.insert(0, f"thread: {thread_id}")
         if agg:
             lines.append("")
             lines.append(f"sessione: {agg.get('turns', 0)} turni")
@@ -821,84 +1078,95 @@ def handle(msg: dict, state: dict) -> None:
             lines.append(f"  out:   {agg.get('output_tokens', 0):,}")
             lines.append(f"  cache: w={agg.get('cache_creation_input_tokens', 0):,} r={agg.get('cache_read_input_tokens', 0):,}")
             lines.append(f"  costo: ${agg.get('cost_usd', 0.0):.4f}")
-        send(chat_id, "\n".join(lines))
+        send(chat_id, "\n".join(lines), thread_id=thread_id)
         return
     if text.startswith("/model"):
         parts = text.split(maxsplit=1)
-        cs = state.setdefault(str(chat_id), {})
+        cs = state.setdefault(skey, {})
         if len(parts) == 1:
             cur = cs.get("model", MODEL) or None
             send_with_keyboard(
                 chat_id,
                 f"🧠 model attuale: {cur or '(default)'}\nScegli:",
                 build_model_keyboard(cur),
+                thread_id=thread_id,
             )
             return
         new_model = parts[1].strip()
         if new_model == "reset":
             cs.pop("model", None)
             save_state(state)
-            send(chat_id, "🧠 model → (default)")
+            send(chat_id, "🧠 model → (default)", thread_id=thread_id)
             return
         cs["model"] = new_model
         save_state(state)
-        send(chat_id, f"🧠 model → {new_model}")
+        send(chat_id, f"🧠 model → {new_model}", thread_id=thread_id)
         return
     if text.startswith("/mode"):
         parts = text.split(maxsplit=1)
         if len(parts) == 1:
-            cur = state.get(str(chat_id), {}).get("mode", DEFAULT_MODE)
-            send(chat_id, f"mode: {cur}\nset con: /mode <plan|acceptEdits|bypassPermissions>")
+            cur = state.get(skey, {}).get("mode", DEFAULT_MODE)
+            send(chat_id, f"mode: {cur}\nset con: /mode <plan|acceptEdits|bypassPermissions>", thread_id=thread_id)
             return
         new_mode = parts[1].strip()
         if new_mode not in VALID_MODES:
-            send(chat_id, f"❌ mode invalida. valide: {', '.join(VALID_MODES)}")
+            send(chat_id, f"❌ mode invalida. valide: {', '.join(VALID_MODES)}", thread_id=thread_id)
             return
-        state.setdefault(str(chat_id), {})["mode"] = new_mode
+        state.setdefault(skey, {})["mode"] = new_mode
         save_state(state)
-        send(chat_id, f"🔐 mode → {new_mode}")
+        send(chat_id, f"🔐 mode → {new_mode}", thread_id=thread_id)
         return
     if text.startswith("/effort"):
         parts = text.split(maxsplit=1)
-        cs = state.setdefault(str(chat_id), {})
+        cs = state.setdefault(skey, {})
         if len(parts) == 1:
             cur = cs.get("effort", DEFAULT_EFFORT) or None
             send_with_keyboard(
                 chat_id,
                 f"🎚 effort attuale: {cur or '(default)'}\nScegli:",
                 build_effort_keyboard(cur),
+                thread_id=thread_id,
             )
             return
         new_eff = parts[1].strip()
         if new_eff == "reset":
             cs.pop("effort", None)
             save_state(state)
-            send(chat_id, "🎚 effort → (default)")
+            send(chat_id, "🎚 effort → (default)", thread_id=thread_id)
             return
         if new_eff not in VALID_EFFORTS:
-            send(chat_id, f"❌ effort invalido. validi: {', '.join(sorted(VALID_EFFORTS))}")
+            send(chat_id, f"❌ effort invalido. validi: {', '.join(sorted(VALID_EFFORTS))}", thread_id=thread_id)
             return
         cs["effort"] = new_eff
         save_state(state)
-        send(chat_id, f"🎚 effort → {new_eff}")
+        send(chat_id, f"🎚 effort → {new_eff}", thread_id=thread_id)
         return
     if text.startswith("/cwd"):
         parts = text.split(maxsplit=1)
         if len(parts) == 1:
-            cur = state.get(str(chat_id), {}).get("cwd", CWD)
-            send(chat_id, f"cwd: {cur}")
+            cur = state.get(skey, {}).get("cwd", CWD)
+            send(chat_id, f"cwd: {cur}", thread_id=thread_id)
             return
         new_cwd = os.path.expanduser(parts[1].strip())
         if not Path(new_cwd).is_dir():
-            send(chat_id, f"❌ non è dir: {new_cwd}")
+            send(chat_id, f"❌ non è dir: {new_cwd}", thread_id=thread_id)
             return
-        state.setdefault(str(chat_id), {})["cwd"] = new_cwd
-        state[str(chat_id)].pop("session_id", None)  # nuova dir, nuova session
+        state.setdefault(skey, {})["cwd"] = new_cwd
+        state[skey].pop("session_id", None)  # nuova dir, nuova session
         save_state(state)
-        send(chat_id, f"📂 cwd → {new_cwd} (sessione resettata)")
+        send(chat_id, f"📂 cwd → {new_cwd} (sessione resettata)", thread_id=thread_id)
         return
 
-    chat_state = state.setdefault(str(chat_id), {})
+    chat_state = state.setdefault(skey, {})
+    # Topic forum senza stato runtime ancora seeded: prova a bindare dal mapping.
+    if thread_id is not None and not chat_state.get("cwd"):
+        reg = forum_reg(state, chat_id)
+        for t in (reg.get("topics") or {}).values():
+            if t.get("thread_id") == thread_id:
+                chat_state.setdefault("cwd", t.get("cwd", CWD))
+                if t.get("session_id") and not chat_state.get("session_id"):
+                    chat_state["session_id"] = t["session_id"]
+                break
     sid = chat_state.get("session_id")
     cwd = chat_state.get("cwd", CWD)
     mode = chat_state.get("mode", DEFAULT_MODE)
@@ -937,33 +1205,45 @@ def handle(msg: dict, state: dict) -> None:
     parts.append(f"[Nuovo messaggio]\n{text}")
     prompt = "\n\n".join(parts)
 
-    status_msg_id = send_status(chat_id, "💭 avvio…")
+    status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
 
     def update_status(label: str) -> None:
         if status_msg_id is not None:
             edit_status(chat_id, status_msg_id, label)
 
-    with TypingPinger(chat_id):
+    with TypingPinger(chat_id, thread_id=thread_id):
         reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort)
     chat_state["session_id"] = new_sid
+    chat_state.setdefault("cwd", cwd)
     accumulate_usage(chat_state, meta)
+    # tieni allineato il mapping topic → sessione corrente
+    if thread_id is not None:
+        reg = forum_reg(state, chat_id)
+        for t in (reg.get("topics") or {}).values():
+            if t.get("thread_id") == thread_id:
+                t["session_id"] = new_sid
+                break
     save_state(state)
     if status_msg_id is not None:
         delete_message(chat_id, status_msg_id)
-    send(chat_id, reply or "(vuoto)")
+    send(chat_id, reply or "(vuoto)", thread_id=thread_id)
 
 
 def handle_callback(cb: dict, state: dict) -> None:
     """Gestisce click su inline_keyboard. callback_data formato: '<key>:<value>'."""
     cb_id = cb.get("id", "")
-    chat = (cb.get("message") or {}).get("chat") or {}
+    message = cb.get("message") or {}
+    chat = message.get("chat") or {}
     chat_id = chat.get("id")
-    msg_id = (cb.get("message") or {}).get("message_id")
-    if chat_id is None or chat_id not in ALLOW:
+    msg_id = message.get("message_id")
+    thread_id = message.get("message_thread_id")
+    from_id = (cb.get("from") or {}).get("id")
+    if (from_id not in ALLOW) and (chat_id not in ALLOW):
         answer_callback(cb_id, "non autorizzato", show_alert=True)
         return
+    skey = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
     data = cb.get("data") or ""
-    cs = state.setdefault(str(chat_id), {})
+    cs = state.setdefault(skey, {})
 
     if data.startswith("effort:"):
         val = data.split(":", 1)[1]
@@ -1042,7 +1322,11 @@ def main() -> None:
                 except Exception as e:
                     log(f"handle err: {e}")
                     try:
-                        send(msg["chat"]["id"], f"💥 errore bot: {e}")
+                        tid = msg.get("message_thread_id")
+                        params = {"chat_id": msg["chat"]["id"], "text": f"💥 errore bot: {e}"}
+                        if tid is not None:
+                            params["message_thread_id"] = tid
+                        tg("sendMessage", **params)
                     except Exception:
                         pass
                 maybe_self_restart()
