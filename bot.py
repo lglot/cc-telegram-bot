@@ -51,6 +51,7 @@ DEFAULT_EFFORT = os.environ.get("CC_DEFAULT_EFFORT", "")  # vuoto = default CC
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
 MODEL_PRESETS = [
+    ("Opus 4.8", "claude-opus-4-8"),
     ("Opus 4.7", "claude-opus-4-7"),
     ("Sonnet 4.6", "claude-sonnet-4-6"),
     ("Haiku 4.5", "claude-haiku-4-5"),
@@ -436,19 +437,29 @@ def fetch_cc_usage() -> dict | None:
     Replica fetchUtilization() del binario CC. Token estratto da keychain macOS
     item 'Claude Code-credentials'. Header obbligatorio anthropic-beta=oauth-2025-04-20.
     """
+    token = None
+    # 1) macOS keychain (se security disponibile)
     try:
         r = subprocess.run(
             ["security", "find-generic-password", "-s", "Claude Code-credentials", "-w"],
             capture_output=True, text=True, timeout=5,
         )
-        if r.returncode != 0:
-            log(f"keychain err: {r.stderr.strip()}")
-            return None
-        creds = json.loads(r.stdout.strip())
-        token = creds["claudeAiOauth"]["accessToken"]
+        if r.returncode == 0:
+            creds = json.loads(r.stdout.strip())
+            token = creds["claudeAiOauth"]["accessToken"]
+    except FileNotFoundError:
+        pass  # `security` non esiste (Linux), tentiamo fallback
     except Exception as e:
-        log(f"oauth token err: {e}")
-        return None
+        log(f"keychain err: {e}")
+    # 2) Linux / fallback: file ~/.claude/.credentials.json
+    if not token:
+        try:
+            cred_path = Path(os.path.expanduser("~/.claude/.credentials.json"))
+            creds = json.loads(cred_path.read_text())
+            token = creds["claudeAiOauth"]["accessToken"]
+        except Exception as e:
+            log(f"oauth token err: {e}")
+            return None
     req = urllib.request.Request(
         "https://api.anthropic.com/api/oauth/usage",
         headers={
@@ -1029,6 +1040,78 @@ def download_file(url: str, dest: Path) -> bool:
 MEDIA_DIR = Path(os.path.expanduser("~/.cc-telegram-bot.media"))
 MEDIA_DIR.mkdir(parents=True, exist_ok=True)
 
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "whisper-1").strip()
+WHISPER_TRANSLATE_LANG = os.environ.get("WHISPER_TRANSLATE_LANG", "").strip()  # es. "English", "Italian"
+
+
+def transcribe_audio(file_path: str) -> str | None:
+    """Trascrive audio via OpenAI Whisper API. Ritorna testo o None su errore/no-key."""
+    if not OPENAI_API_KEY:
+        return None
+    try:
+        import mimetypes
+        boundary = "----cctgbot" + os.urandom(8).hex()
+        mime = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+        name = os.path.basename(file_path)
+        with open(file_path, "rb") as fh:
+            file_bytes = fh.read()
+        body = (
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="model"\r\n\r\n'
+            f"{WHISPER_MODEL}\r\n"
+            f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            f"Content-Type: {mime}\r\n\r\n"
+        ).encode() + file_bytes + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/audio/transcriptions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=120) as r:
+            payload = json.loads(r.read().decode("utf-8"))
+        text = (payload.get("text") or "").strip()
+        return text or None
+    except Exception as e:
+        log(f"whisper err: {e}")
+        return None
+
+
+def translate_text(text: str, target_lang: str) -> str | None:
+    """Traduce testo verso target_lang via GPT-4o-mini."""
+    if not OPENAI_API_KEY or not text:
+        return None
+    try:
+        body = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": f"Translate to {target_lang}. Return only the translation, no explanation."},
+                {"role": "user", "content": text},
+            ],
+            "max_tokens": 1000,
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=30) as r:
+            payload = json.loads(r.read().decode())
+        result = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        return result.strip() or None
+    except Exception as e:
+        log(f"translate err: {e}")
+        return None
+
 
 def extract_media_paths(msg: dict) -> tuple[list[str], str]:
     """Scarica eventuali photo/document/audio/voice. Ritorna (paths, caption)."""
@@ -1060,18 +1143,33 @@ def extract_media_paths(msg: dict) -> tuple[list[str], str]:
             if dest.exists():
                 paths.append(str(dest))
 
-    # voice / audio
+    # voice / audio (con tentativo di trascrizione via Whisper API se OPENAI_API_KEY)
     for k in ("voice", "audio", "video", "video_note"):
         m = msg.get(k)
-        if m:
-            url = tg_get_file_url(m["file_id"])
-            if url:
-                ext = url.rsplit(".", 1)[-1].split("?")[0][:5] or "bin"
-                dest = MEDIA_DIR / f"{m['file_unique_id']}.{ext}"
-                if not dest.exists() and download_file(url, dest):
-                    pass
-                if dest.exists():
-                    paths.append(str(dest))
+        if not m:
+            continue
+        url = tg_get_file_url(m["file_id"])
+        if not url:
+            continue
+        ext = url.rsplit(".", 1)[-1].split("?")[0][:5] or "bin"
+        dest = MEDIA_DIR / f"{m['file_unique_id']}.{ext}"
+        if not dest.exists():
+            download_file(url, dest)
+        if not dest.exists():
+            continue
+        if k in ("voice", "audio"):
+            transcript = transcribe_audio(str(dest))
+            if transcript:
+                display = f"🎙 {transcript}"
+                if WHISPER_TRANSLATE_LANG:
+                    translation = translate_text(transcript, WHISPER_TRANSLATE_LANG)
+                    if translation and translation.strip().lower() != transcript.strip().lower():
+                        display += f"\n🌐 {translation}"
+                        log(f"whisper: {k} tradotto in {WHISPER_TRANSLATE_LANG}")
+                caption = (display + ("\n" + caption if caption else "")).strip()
+                log(f"whisper: {k} trascritto, {len(transcript)} char")
+                continue  # binario inutile al modello, salto path
+        paths.append(str(dest))
 
     return paths, caption
 
@@ -1107,13 +1205,9 @@ def handle(msg: dict, state: dict) -> None:
             return
 
     text = msg.get("text", "").strip()
-    media_paths, caption = extract_media_paths(msg)
-    if not text and not media_paths:
+    has_potential_media = any(msg.get(k) for k in ("photo", "document", "voice", "audio", "video", "video_note", "caption"))
+    if not text and not has_potential_media:
         return
-    if media_paths and not text:
-        # Foto/file senza testo: usa caption (o prompt default)
-        text = caption or "Analizza il file allegato."
-        log(f"media: {len(media_paths)} file, caption={caption!r}")
     if text in ("/start", "/help"):
         send(
             chat_id,
@@ -1306,6 +1400,16 @@ def handle(msg: dict, state: dict) -> None:
     effort = chat_state.get("effort", DEFAULT_EFFORT) or None
     summary = chat_state.pop("compact_summary", None)
 
+    status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
+
+    media_paths, caption = extract_media_paths(msg)
+    if not text and not media_paths and not caption:
+        delete_message(chat_id, status_msg_id)
+        return
+    if not text:
+        text = caption or "Analizza il file allegato."
+        log(f"media: {len(media_paths)} file, caption={caption!r}")
+
     # Reply-to: includi messaggio citato come contesto
     reply_to = msg.get("reply_to_message") or {}
     quoted = (reply_to.get("text") or reply_to.get("caption") or "").strip()
@@ -1336,8 +1440,6 @@ def handle(msg: dict, state: dict) -> None:
         parts.append(f"[File allegati (path locali)]\n{files_block}")
     parts.append(f"[Nuovo messaggio]\n{text}")
     prompt = "\n\n".join(parts)
-
-    status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
 
     def update_status(label: str) -> None:
         if status_msg_id is not None:
