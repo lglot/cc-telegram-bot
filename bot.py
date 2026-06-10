@@ -20,13 +20,15 @@ Config via env:
   TG_ALLOW_CHAT_IDS  csv di chat_id/user_id ammessi (obbligatorio)
   CC_CWD             working dir per claude (default ~)
   CC_MODEL           model id opzionale (es. claude-opus-4-7)
-  CC_TIMEOUT         timeout subprocess in s (default 300)
+  CC_TIMEOUT         timeout subprocess in s (default 3600)
+  CC_HEARTBEAT       intervallo update progresso in s (default 120)
   STATE_FILE         path stato sessioni (default ~/.cc-telegram-bot.state.json)
   CC_PROJECTS_DIR    dir sessioni CC (default ~/.claude/projects)
   SYNC_EXCLUDE       csv di substring dir da escludere dal sync topic
   MAX_TOPICS         max topic creati per /sync (default 40)
 """
 import atexit
+import concurrent.futures
 import fcntl
 import glob
 import json
@@ -43,7 +45,8 @@ TOKEN = os.environ["TG_TOKEN"]
 ALLOW = {int(x) for x in os.environ["TG_ALLOW_CHAT_IDS"].split(",") if x.strip()}
 CWD = os.path.expanduser(os.environ.get("CC_CWD", "~"))
 MODEL = os.environ.get("CC_MODEL", "")
-TIMEOUT = int(os.environ.get("CC_TIMEOUT", "300"))
+TIMEOUT = int(os.environ.get("CC_TIMEOUT", "3600"))
+HEARTBEAT = int(os.environ.get("CC_HEARTBEAT", "120"))  # s tra update "sto lavorando"
 STATE_FILE = Path(os.path.expanduser(os.environ.get("STATE_FILE", "~/.cc-telegram-bot.state.json")))
 DEFAULT_MODE = os.environ.get("CC_DEFAULT_MODE", "bypassPermissions")  # plan|acceptEdits|bypassPermissions
 VALID_MODES = {"plan", "acceptEdits", "bypassPermissions"}
@@ -51,10 +54,10 @@ DEFAULT_EFFORT = os.environ.get("CC_DEFAULT_EFFORT", "")  # vuoto = default CC
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
 MODEL_PRESETS = [
+    ("Fable 5", "claude-fable-5"),
     ("Opus 4.8", "claude-opus-4-8"),
     ("Opus 4.7", "claude-opus-4-7"),
     ("Sonnet 4.6", "claude-sonnet-4-6"),
-    ("Haiku 4.5", "claude-haiku-4-5"),
 ]
 API = f"https://api.telegram.org/bot{TOKEN}"
 TG_LIMIT = 4000  # leave room for markup overhead
@@ -87,6 +90,13 @@ BOT_PY_PATH = Path(__file__).resolve()
 RUN_SH_PATH = BOT_PY_PATH.parent / "run.sh"
 INITIAL_MTIME = BOT_PY_PATH.stat().st_mtime
 
+# Concorrenza: ogni messaggio gira su un thread separato per non bloccare il polling.
+# _active_skeys serializza richieste sullo stesso topic/chat (stessa sessione Claude).
+_state_lock = threading.Lock()      # save_state atomica
+_active_skeys: set = set()
+_active_lock = threading.Lock()
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=20, thread_name_prefix="cc-worker")
+
 
 def acquire_singleton_lock() -> None:
     """Garantisce una sola istanza del bot via flock esclusivo non-bloccante.
@@ -117,6 +127,8 @@ BOT_COMMANDS = [
     {"command": "effort", "description": "Effort level (low|medium|high|xhigh|max)"},
     {"command": "cwd", "description": "Mostra/cambia working directory"},
     {"command": "model", "description": "Mostra/cambia model id"},
+    {"command": "caveman", "description": "Toggle stile caveman (on|off)"},
+    {"command": "handoff", "description": "Handoff → nuova sessione in nuovo topic"},
     {"command": "sync", "description": "Crea/aggiorna i thread delle sessioni CC (forum)"},
     {"command": "threads", "description": "Lista thread sessione mappati (forum)"},
 ]
@@ -136,7 +148,8 @@ def load_state() -> dict:
 
 
 def save_state(state: dict) -> None:
-    STATE_FILE.write_text(json.dumps(state, indent=2))
+    with _state_lock:
+        STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
 def maybe_self_restart() -> None:
@@ -145,6 +158,7 @@ def maybe_self_restart() -> None:
     Da chiamare solo dopo che l'offset Telegram è stato persistito e il turno
     corrente è completato (ack inviato + reply consegnato), così non c'è loop
     di replay. Valida la sintassi prima di reload per evitare crash loop.
+    Con threading: aspetta che tutti i worker attivi abbiano finito prima di execv.
     """
     try:
         cur = BOT_PY_PATH.stat().st_mtime
@@ -152,6 +166,10 @@ def maybe_self_restart() -> None:
         return
     if cur == INITIAL_MTIME:
         return
+    # Se ci sono worker attivi il restart verrà fatto dall'ultimo che termina.
+    with _active_lock:
+        if _active_skeys:
+            return
     try:
         import ast
         ast.parse(BOT_PY_PATH.read_text())
@@ -472,9 +490,12 @@ def fetch_cc_usage() -> dict | None:
     try:
         with urllib.request.urlopen(req, timeout=10) as r:
             return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        log(f"usage fetch err: {e}")
+        return {"_error": f"HTTP {e.code} {e.reason}"}
     except Exception as e:
         log(f"usage fetch err: {e}")
-        return None
+        return {"_error": str(e)}
 
 
 def fmt_usage(data: dict) -> str:
@@ -916,12 +937,31 @@ def run_claude_streaming(
     meta: dict = {}
     pending_tools: dict[str, str] = {}  # tool_use_id -> label
     last_label = ""
+    last_text = ""  # ultimo blocco text del modello (fallback se result vuoto)
+    start_ts = time.time()
+    tool_count = 0
 
     def emit(label: str) -> None:
         nonlocal last_label
         if on_status and label and label != last_label:
             last_label = label
             on_status(label)
+
+    # Heartbeat: con tool lunghi (un singolo Bash da 10min) emit() non scatta
+    # mai; questo thread aggiorna comunque lo status così l'utente vede che il
+    # lavoro procede.
+    hb_stop = threading.Event()
+
+    def _heartbeat() -> None:
+        while not hb_stop.wait(HEARTBEAT):
+            if on_status:
+                el = int(time.time() - start_ts)
+                m, s = divmod(el, 60)
+                base = last_label or "💭 al lavoro…"
+                on_status(f"{base}\n⏳ {m}m{s:02d}s · {tool_count} tool · sto ancora lavorando…")
+
+    if on_status:
+        threading.Thread(target=_heartbeat, daemon=True, name="cc-heartbeat").start()
 
     deadline = time.time() + TIMEOUT
     try:
@@ -952,10 +992,14 @@ def run_claude_streaming(
                         if summary:
                             label += f"  {summary}"
                         pending_tools[tool_id] = name
+                        tool_count += 1
                         emit(label)
                     elif bt == "text":
-                        # streaming testo modello (raro in stream-json non-partial)
-                        pass
+                        # tieni l'ultimo testo del modello: se l'evento result
+                        # arriva vuoto (subtype d'errore post-testo), è il
+                        # fallback che evita di rispondere "(vuoto)"
+                        if (block.get("text") or "").strip():
+                            last_text = block["text"]
             elif t == "user":
                 # tool_result block(s) — segnaliamo "elaboro risultato"
                 content = (evt.get("message") or {}).get("content") or []
@@ -976,6 +1020,8 @@ def run_claude_streaming(
                 }
                 if evt.get("is_error"):
                     final_text = f"❌ {final_text or evt.get('subtype', 'error')}"
+                if not (evt.get("result") or "").strip():
+                    log(f"result vuoto (subtype={evt.get('subtype')}, is_error={evt.get('is_error')}) — uso fallback last_text ({len(last_text)} char)")
         proc.wait(timeout=10)
     except subprocess.TimeoutExpired:
         proc.kill()
@@ -984,12 +1030,14 @@ def run_claude_streaming(
         proc.kill()
         log(f"stream err: {e}")
         return f"❌ stream err: {e}", session_id, {}
+    finally:
+        hb_stop.set()
 
     if proc.returncode and proc.returncode != 0 and not final_text:
         err = (proc.stderr.read() if proc.stderr else "")[:1500]
         return f"❌ claude exit {proc.returncode}\n{err}", session_id, {}
 
-    return final_text or "(vuoto)", new_sid, meta
+    return final_text or last_text or "(vuoto)", new_sid, meta
 
 
 # Wrapper retro-compatibile (non usato in handle, mantenuto per compat)
@@ -1220,6 +1268,8 @@ def handle(msg: dict, state: dict) -> None:
             "/effort [low|medium|high|xhigh|max|reset] — effort level\n"
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
+            "/caveman [on|off] — toggle stile caveman (default off)\n"
+            "/handoff [nome] — handoff sessione → nuova sessione (nuovo topic se forum)\n"
             "/sync — crea/aggiorna i thread delle sessioni CC (forum)\n"
             "/threads — lista thread mappati (forum)\n"
             "/help — questo messaggio\n\n"
@@ -1252,8 +1302,9 @@ def handle(msg: dict, state: dict) -> None:
     if text == "/usage":
         chat_action(chat_id, "typing", thread_id=thread_id)
         data = fetch_cc_usage()
-        if not data:
-            send(chat_id, "❌ impossibile leggere usage piano (keychain o endpoint non raggiungibili)", thread_id=thread_id)
+        if not data or "_error" in data:
+            err = (data or {}).get("_error", "token non trovato o endpoint irraggiungibile")
+            send(chat_id, f"❌ usage: {err}", thread_id=thread_id)
             return
         send(chat_id, fmt_usage(data), thread_id=thread_id)
         return
@@ -1280,6 +1331,78 @@ def handle(msg: dict, state: dict) -> None:
         save_state(state)
         send(chat_id, f"🗜 sessione compattata. Riassunto:\n\n{summary}\n\n— prossimo prompt parte da zero con questo contesto.", thread_id=thread_id)
         return
+    if text.startswith("/handoff"):
+        parts = text.split(maxsplit=1)
+        topic_name = parts[1].strip() if len(parts) > 1 else ""
+        cs = state.setdefault(skey, {})
+        sid = cs.get("session_id")
+        if not sid:
+            send(chat_id, "⚠️ nessuna sessione attiva da cui fare handoff", thread_id=thread_id)
+            return
+        cwd = cs.get("cwd", CWD)
+        mode = cs.get("mode", DEFAULT_MODE)
+        model = cs.get("model", MODEL) or None
+        eff = cs.get("effort", DEFAULT_EFFORT) or None
+        # Se la skill/command /handoff è installata su QUESTO host la usiamo,
+        # altrimenti prompt equivalente built-in (la skill sul Mac non è
+        # visibile al claude che gira qui).
+        has_skill = (
+            Path(os.path.expanduser("~/.claude/skills/handoff")).exists()
+            or Path(os.path.expanduser("~/.claude/commands/handoff.md")).exists()
+        )
+        prompt = (
+            f"/handoff {topic_name or 'continuare il lavoro corrente'} — oltre a "
+            "salvare il file, riporta il documento di handoff completo come testo "
+            "della risposta (verrà usato come contesto della nuova sessione)."
+        ) if has_skill else (
+            "Prepara un documento di handoff per passare questo lavoro a una nuova "
+            "sessione che parte da zero (max 3000 caratteri). Includi: obiettivo, "
+            "stato attuale, decisioni prese e perché, file creati/modificati con "
+            "path, task pending in ordine di priorità, gotcha e contesto tecnico "
+            "indispensabile. Solo il documento, niente preamboli."
+        )
+        status_id = send_status(chat_id, "🤝 genero handoff dalla sessione corrente…", thread_id=thread_id)
+        with TypingPinger(chat_id, thread_id=thread_id):
+            doc, _hsid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, effort=eff)
+        accumulate_usage(cs, meta)
+        if status_id is not None:
+            delete_message(chat_id, status_id)
+        if doc.startswith(("❌", "⏱")) or not doc.strip():
+            send(chat_id, f"handoff fallito: {doc}", thread_id=thread_id)
+            return
+        if not is_forum_msg(msg):
+            # niente Topics: handoff in place (come /compact ma con doc ricco)
+            cs["compact_summary"] = doc
+            cs.pop("session_id", None)
+            save_state(state)
+            send(chat_id, f"🤝 handoff pronto:\n\n{doc}\n\n— prossimo prompt = nuova sessione con questo contesto.", thread_id=thread_id)
+            return
+        name = topic_name or f"handoff {time.strftime('%d/%m %H:%M')}"
+        tid, err = create_forum_topic(chat_id, f"🤝 {name}", icon_color=TOPIC_COLORS[len(name) % len(TOPIC_COLORS)])
+        if tid is None:
+            send(chat_id, f"❌ creazione topic fallita: {err}\nℹ️ il bot deve essere admin con 'Manage Topics'.", thread_id=thread_id)
+            return
+        nskey = f"{chat_id}:{tid}"
+        ncs = state.setdefault(nskey, {})
+        ncs["cwd"] = cwd
+        ncs["compact_summary"] = doc  # primo messaggio nel topic → sessione nuova con questo contesto
+        for k in ("mode", "model", "effort", "caveman"):
+            if k in cs:
+                ncs[k] = cs[k]
+        forum_reg(state, chat_id).setdefault("topics", {})[f"handoff-{tid}"] = {
+            "thread_id": tid, "cwd": cwd, "name": name, "session_id": None,
+        }
+        save_state(state)
+        send(
+            chat_id,
+            f"🤝 **{name}**\n"
+            f"cwd: `{cwd}`\n\n"
+            f"{doc}\n\n"
+            f"— scrivi qui: il primo messaggio apre una sessione nuova con questo contesto.",
+            thread_id=tid,
+        )
+        send(chat_id, f"✅ handoff → topic «{name}». Questa sessione resta attiva qui.", thread_id=thread_id)
+        return
     if text == "/status":
         cs = state.get(skey, {})
         sid = cs.get("session_id")
@@ -1294,6 +1417,7 @@ def handle(msg: dict, state: dict) -> None:
             f"mode: {mode}",
             f"model: {model or '(default)'}",
             f"effort: {eff or '(default)'}",
+            f"caveman: {'on' if cs.get('caveman') else 'off'}",
         ]
         if thread_id is not None:
             lines.insert(0, f"thread: {thread_id}")
@@ -1327,6 +1451,23 @@ def handle(msg: dict, state: dict) -> None:
         cs["model"] = new_model
         save_state(state)
         send(chat_id, f"🧠 model → {new_model}", thread_id=thread_id)
+        return
+    if text.startswith("/caveman"):
+        parts = text.split(maxsplit=1)
+        cs = state.setdefault(skey, {})
+        if len(parts) == 1:
+            new_val = not cs.get("caveman", False)
+        elif parts[1].strip().lower() in ("on", "off"):
+            new_val = parts[1].strip().lower() == "on"
+        else:
+            send(chat_id, "uso: /caveman [on|off] (senza argomento = toggle)", thread_id=thread_id)
+            return
+        cs["caveman"] = new_val
+        save_state(state)
+        if new_val:
+            send(chat_id, "🪨 caveman ON. pochi token. brain still big.", thread_id=thread_id)
+        else:
+            send(chat_id, "🗣 caveman OFF — risposte in italiano normale.", thread_id=thread_id)
         return
     if text.startswith("/mode"):
         parts = text.split(maxsplit=1)
@@ -1431,6 +1572,20 @@ def handle(msg: dict, state: dict) -> None:
         "Per restart immediato senza modifiche usa `touch bot.py`."
     )
     parts.append(harness_note)
+    # Stile risposta: anche con caveman OFF la nota è necessaria, perché le
+    # sessioni nate sul Mac (plugin caveman attivo lì) trascinano lo stile
+    # compresso per inerzia dalla history al resume.
+    if chat_state.get("caveman"):
+        parts.append(
+            "[Stile risposta]\nRispondi in stile caveman compresso: frasi minime, "
+            "niente articoli superflui, massima densità tecnica, ~75% token in meno."
+        )
+    else:
+        parts.append(
+            "[Stile risposta]\nIgnora qualsiasi stile 'caveman' compresso presente "
+            "nella history di questa sessione: rispondi in italiano normale, frasi "
+            "complete e chiare."
+        )
     if summary and not sid:
         parts.append(f"[Contesto sessione precedente compattata]\n{summary}")
     if quoted:
@@ -1524,6 +1679,13 @@ def handle_callback(cb: dict, state: dict) -> None:
     answer_callback(cb_id, "callback non riconosciuto")
 
 
+def _msg_skey(msg: dict) -> str:
+    """Calcola la session key per un messaggio (stessa logica di handle())."""
+    chat = msg.get("chat") or {}
+    thread_id = msg.get("message_thread_id")
+    return f"{chat.get('id')}:{thread_id}" if thread_id is not None else str(chat.get("id", ""))
+
+
 def main() -> None:
     acquire_singleton_lock()
     PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
@@ -1559,19 +1721,46 @@ def main() -> None:
                 msg = upd.get("message")
                 if not msg:
                     continue
-                try:
-                    handle(msg, state)
-                except Exception as e:
-                    log(f"handle err: {e}")
+
+                skey = _msg_skey(msg)
+                with _active_lock:
+                    already = skey in _active_skeys
+                    if not already:
+                        _active_skeys.add(skey)
+
+                if already:
+                    # Stessa sessione ancora in elaborazione: notifica e scarta.
                     try:
+                        cid = msg["chat"]["id"]
                         tid = msg.get("message_thread_id")
-                        params = {"chat_id": msg["chat"]["id"], "text": f"💥 errore bot: {e}"}
+                        params = {"chat_id": cid, "text": "⏳ sessione occupata, riprova tra poco."}
                         if tid is not None:
                             params["message_thread_id"] = tid
                         tg("sendMessage", **params)
                     except Exception:
                         pass
-                maybe_self_restart()
+                    maybe_self_restart()
+                    continue
+
+                def _worker(msg=msg, state=state, skey=skey):
+                    try:
+                        handle(msg, state)
+                    except Exception as e:
+                        log(f"handle err: {e}")
+                        try:
+                            tid = msg.get("message_thread_id")
+                            params = {"chat_id": msg["chat"]["id"], "text": f"💥 errore bot: {e}"}
+                            if tid is not None:
+                                params["message_thread_id"] = tid
+                            tg("sendMessage", **params)
+                        except Exception:
+                            pass
+                    finally:
+                        with _active_lock:
+                            _active_skeys.discard(skey)
+                        maybe_self_restart()
+
+                _executor.submit(_worker)
         except KeyboardInterrupt:
             log("bye")
             sys.exit(0)
