@@ -658,23 +658,37 @@ def manifest_add(cwd: str, sid: str) -> bool:
     return added
 
 
+def publish_target(state: dict) -> int | None:
+    """Chat di destinazione dei topic publish.
+
+    Priorità: env PUBLISH_CHAT_ID > chat privata (Bot API 9.3/9.4: topics nelle
+    chat private col bot, ON via BotFather) > forum di gruppo registrato.
+    """
+    env_t = os.environ.get("PUBLISH_CHAT_ID", "").strip()
+    if env_t:
+        return int(env_t)
+    if ALLOW:
+        return min(ALLOW)
+    forums = state.get("_forums") or {}
+    for cid, reg in forums.items():
+        if reg.get("registered"):
+            return int(cid)
+    return None
+
+
 def process_publish_queue(state: dict) -> None:
-    """Scansiona PUBLISH_DIR: per ogni richiesta crea+binda un topic forum.
+    """Scansiona PUBLISH_DIR: per ogni richiesta crea+binda un topic.
 
     Richiesta json depositata da `claude-publish` (Mac via SSH): {uuid, cwd, name}.
-    Usa l'unico forum registrato in state["_forums"]. Idempotente per dir_key.
+    I topic vengono creati nella chat privata col bot (topics privati, Bot API
+    9.4) o nel forum registrato. Idempotente per dir_key.
     """
     if not PUBLISH_DIR.is_dir():
         return
     reqs = sorted(glob.glob(str(PUBLISH_DIR / "*.json")))
     if not reqs:
         return
-    forums = state.get("_forums") or {}
-    forum_id = None
-    for cid, reg in forums.items():
-        if reg.get("registered"):
-            forum_id = int(cid)
-            break
+    forum_id = publish_target(state)
     for rp in reqs:
         try:
             req = json.loads(Path(rp).read_text())
@@ -688,8 +702,7 @@ def process_publish_queue(state: dict) -> None:
             os.remove(rp)
             continue
         if forum_id is None:
-            for aid in ALLOW:
-                send(aid, f"📤 publish '{name}' in attesa: manda prima un messaggio nel gruppo forum per registrarlo.")
+            log(f"publish '{name}' senza destinazione (ALLOW vuoto?)")
             return  # lascia la richiesta in coda, riprova al prossimo giro
         reg = forum_reg(state, forum_id)
         topics = reg.setdefault("topics", {})
@@ -704,7 +717,7 @@ def process_publish_queue(state: dict) -> None:
             tid, err = create_forum_topic(forum_id, f"📂 {name}", icon_color=color)
             if tid is None:
                 for aid in ALLOW:
-                    send(aid, f"❌ publish '{name}' fallita: {err}\n(il bot deve essere admin del gruppo con permesso Manage Topics)")
+                    send(aid, f"❌ publish '{name}' fallita: {err}\n(topics privati abilitati via BotFather? in un gruppo serve admin con Manage Topics)")
                 os.remove(rp)
                 continue
             topics[dk] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": uuid}
@@ -831,7 +844,7 @@ def do_sync(chat_id: int, state: dict) -> str:
         lines.append(f"↻ aggiornati ({len(updated)}): " + ", ".join(updated))
     if errors:
         lines.append("❌ errori:\n" + "\n".join(f"  • {e}" for e in errors))
-        lines.append("ℹ️ se 'not enough rights': rendi il bot admin con permesso 'Manage Topics'.")
+        lines.append("ℹ️ chat privata: topics abilitati via BotFather? gruppo: bot admin con 'Manage Topics'.")
     return "\n".join(lines)
 
 
@@ -839,7 +852,7 @@ def fmt_threads(state: dict, chat_id: int) -> str:
     reg = forum_reg(state, chat_id)
     topics = reg.get("topics") or {}
     if not topics:
-        return "Nessun thread mappato. Usa /sync in un supergruppo con Topics."
+        return "Nessun thread mappato. Pubblica una sessione dal Mac con /remote-desktop, o usa /sync."
     lines = [f"🧵 {len(topics)} thread:"]
     for dk, t in topics.items():
         sid = (t.get("session_id") or "")[:8]
@@ -1220,17 +1233,19 @@ def handle(msg: dict, state: dict) -> None:
             "/effort [low|medium|high|xhigh|max|reset] — effort level\n"
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
-            "/sync — crea/aggiorna i thread delle sessioni CC (forum)\n"
-            "/threads — lista thread mappati (forum)\n"
+            "/sync — crea/aggiorna i thread delle sessioni CC\n"
+            "/threads — lista thread mappati\n"
             "/help — questo messaggio\n\n"
-            "In un supergruppo con Topics: ogni thread = una sessione CC separata.\n"
+            "Topics attivi (anche in questa chat privata): ogni thread = una sessione CC separata.\n"
+            "Dal Mac: /remote-desktop in una sessione la pubblica qui come thread.\n"
             "Altro testo = prompt a Claude (continua la sessione del thread corrente).",
             thread_id=thread_id,
         )
         return
     if text == "/sync":
-        if not is_forum_msg(msg):
-            send(chat_id, "ℹ️ /sync funziona solo in un supergruppo con i Topics abilitati.", thread_id=thread_id)
+        chat_type = (msg.get("chat") or {}).get("type")
+        if chat_type != "private" and not is_forum_msg(msg):
+            send(chat_id, "ℹ️ /sync funziona in chat privata (topics abilitati via BotFather) o in un supergruppo forum.", thread_id=thread_id)
             return
         forum_reg(state, chat_id)["registered"] = True
         send(chat_id, "🔄 sincronizzo i thread…", thread_id=thread_id)
