@@ -1585,7 +1585,10 @@ def handle(msg: dict, state: dict) -> None:
         "`ast.parse` e fa `os.execv(run.sh)`. Quindi: edita pure `bot.py` e basta, "
         "NON usare comandi del process manager (launchctl/systemctl/pkill) — "
         "termineresti il tuo processo padre prima dell'ack causando replay loop. "
-        "Per restart immediato senza modifiche usa `touch bot.py`."
+        "Per restart immediato senza modifiche usa `touch bot.py`. "
+        "Se modifichi bot.py: a modifica fatta esegui anche "
+        "`git -C ~/code/cc-telegram-bot add bot.py && git -C ~/code/cc-telegram-bot commit -m 'feat(live): <cosa>' && git -C ~/code/cc-telegram-bot push` "
+        "(repo personale lglot/cc-telegram-bot, push diretto su main ok): le modifiche live mai committate divergono dal repo e bloccano i deploy."
     )
     parts.append(harness_note)
     # Stile risposta: anche con caveman OFF la nota è necessaria, perché le
