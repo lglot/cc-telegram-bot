@@ -647,35 +647,55 @@ def _enc_cwd(cwd: str) -> str:
     return _re.sub(r"[/.]", "-", cwd)
 
 
-def manifest_add(cwd: str, sid: str) -> bool:
-    """Aggiunge una sessione al manifest Syncthing (shared-includes), idempotente.
+MANIFEST_HEADER = "// sessioni pubblicate (gestito da claude-publish / bot). NON editare a mano: manifest-rebuild."
 
-    Scrive due righe .stignore-include (la dir encoded + il file .jsonl) così
-    Syncthing sincronizza solo quella sessione. Ritorna True se ha aggiunto righe.
+
+def manifest_add(cwd: str, sid: str) -> bool:
+    """Aggiunge una sessione al manifest Syncthing e lo riscrive in forma canonica.
+
+    Forma canonica first-match-wins (.stignore):
+        !/<enc>/<uuid>.jsonl    file sessione
+        !/<enc>/<uuid>          subdir sessione (subagents/, tool-results/)
+        /<enc>/**               ignora il RESTO del contenuto della dir
+        !/<enc>                 re-include la sola dir (traversal)
+    NB: un pattern dir nudo "!/<enc>" includerebbe ricorsivamente l'intera
+    directory (bug: trascinava l'intera dir wiki, 246MB). Ordine obbligato:
+    per questo niente append, sempre rebuild completo.
+    Ritorna True se la sessione non era già nel manifest.
     """
     if not cwd or not sid:
         return False
     enc = _enc_cwd(normalize_cwd(cwd))
-    needed = [f"!/{enc}", f"!/{enc}/{sid}.jsonl"]
+    pairs: set[tuple[str, str]] = set()
+    prev = ""
     try:
-        existing = MANIFEST.read_text().splitlines() if MANIFEST.exists() else []
+        if MANIFEST.exists():
+            prev = MANIFEST.read_text()
+            for ln in prev.splitlines():
+                m = _re.match(r"^!/([^/]+)/([0-9a-fA-F-]+)\.jsonl\s*$", ln.strip())
+                if m:
+                    pairs.add((m.group(1), m.group(2)))
     except Exception:
-        existing = []
-    have = set(existing)
-    added = False
-    for ln in needed:
-        if ln not in have:
-            existing.append(ln)
-            have.add(ln)
-            added = True
-    if added:
-        try:
-            MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-            MANIFEST.write_text("\n".join(existing) + "\n")
+        pass
+    added = (enc, sid) not in pairs
+    pairs.add((enc, sid))
+    dirs = sorted({e for e, _ in pairs})
+    lines = [MANIFEST_HEADER]
+    for e, u in sorted(pairs):
+        lines.append(f"!/{e}/{u}.jsonl")
+        lines.append(f"!/{e}/{u}")
+    for e in dirs:
+        lines.append(f"/{e}/**")
+    for e in dirs:
+        lines.append(f"!/{e}")
+    try:
+        MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+        MANIFEST.write_text("\n".join(lines) + "\n")
+        if added:
             log(f"manifest += {enc}/{sid[:8]}")
-        except Exception as e:
-            log(f"manifest_add err: {e}")
-            return False
+    except Exception as e:
+        log(f"manifest_add err: {e}")
+        return False
     return added
 
 
