@@ -787,7 +787,9 @@ def process_publish_queue(state: dict) -> None:
                 entry["name"] = name
             entry["session_id"] = uuid
             entry["cwd"] = cwd
-            state.setdefault(f"{forum_id}:{tid}", {})["session_id"] = uuid
+            rcs = state.setdefault(f"{forum_id}:{tid}", {})
+            rcs["session_id"] = uuid
+            rcs["owned"] = False  # sessione del Mac: primo resume con fork
             send(forum_id, f"↻ ri-pubblicata: **{name}** (sessione `{uuid[:8]}`).", thread_id=tid)
         else:
             color = TOPIC_COLORS[len(topics) % len(TOPIC_COLORS)]
@@ -801,6 +803,7 @@ def process_publish_queue(state: dict) -> None:
             cs = state.setdefault(f"{forum_id}:{tid}", {})
             cs["cwd"] = cwd
             cs["session_id"] = uuid
+            cs["owned"] = False  # sessione del Mac: primo resume con fork
             send(forum_id, intro, thread_id=tid)
         if recap:
             send(forum_id, f"📋 **Recap sessione**\n\n{recap}", thread_id=tid)
@@ -896,7 +899,8 @@ def do_sync(chat_id: int, state: dict) -> str:
         skey = f"{chat_id}:{tid}"
         cs = state.setdefault(skey, {})
         cs.setdefault("cwd", proj["cwd"])
-        cs.setdefault("session_id", proj["latest_sid"])
+        if cs.setdefault("session_id", proj["latest_sid"]) == proj["latest_sid"]:
+            cs.setdefault("owned", False)  # sessione potenzialmente del Mac: fork al primo uso
         created.append(proj["name"])
         # intro nel nuovo topic
         send(
@@ -969,10 +973,15 @@ def run_claude_streaming(
     model: str | None,
     on_status: "callable | None" = None,
     effort: str | None = None,
+    fork: bool = False,
 ) -> tuple[str, str | None, dict]:
     """Lancia claude con --output-format stream-json e parsa eventi in tempo reale.
 
     `on_status(label)` viene chiamato a ogni cambio tool corrente.
+    `fork=True` aggiunge --fork-session: claude -p --resume RIUSA lo stesso
+    session id e SCRIVE LO STESSO file jsonl (verificato empiricamente); su una
+    sessione pubblicata dal Mac scriverebbe il file che il Mac sta scrivendo ->
+    sync-conflict garantito. Il fork crea un id/file nuovo di proprieta locale.
     Ritorna (testo_finale, new_session_id, meta).
     """
     cwd = normalize_cwd(cwd)  # canonicalizza (/home/luigi -> /Users/luigilotito su lgcloud)
@@ -990,7 +999,9 @@ def run_claude_streaming(
         cmd += ["--effort", eff_effort]
     if session_id:
         cmd += ["--resume", session_id]
-    log(f"claude stream (resume={'y' if session_id else 'n'}, mode={mode}, model={eff_model or 'default'}, effort={eff_effort or 'default'}, cwd={cwd}): {prompt[:80]!r}")
+        if fork:
+            cmd += ["--fork-session"]
+    log(f"claude stream (resume={'y' if session_id else 'n'}{'+fork' if (session_id and fork) else ''}, mode={mode}, model={eff_model or 'default'}, effort={eff_effort or 'default'}, cwd={cwd}): {prompt[:80]!r}")
 
     proc = subprocess.Popen(
         cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1,
@@ -1600,6 +1611,7 @@ def handle(msg: dict, state: dict) -> None:
                 chat_state.setdefault("cwd", t.get("cwd", CWD))
                 if t.get("session_id") and not chat_state.get("session_id"):
                     chat_state["session_id"] = t["session_id"]
+                    chat_state.setdefault("owned", False)
                 break
     sid = chat_state.get("session_id")
     cwd = chat_state.get("cwd", CWD)
@@ -1608,12 +1620,17 @@ def handle(msg: dict, state: dict) -> None:
     effort = chat_state.get("effort", DEFAULT_EFFORT) or None
     summary = chat_state.pop("compact_summary", None)
 
-    # Sessione pubblicata ma file non ancora arrivato via Syncthing: rispondi
-    # chiaro invece di lanciare un resume che fallirebbe con error_during_execution.
+    # Sessione pubblicata (owned=False) ma file non ancora arrivato via Syncthing:
+    # rispondi chiaro invece di un resume che fallirebbe con error_during_execution.
     # NON resettare session_id: al prossimo messaggio il file sarà arrivato.
-    if sid and not session_file_exists(cwd, sid):
+    # (Per le sessioni locali, owned=True, il file esiste per definizione.)
+    if sid and not chat_state.get("owned", True) and not session_file_exists(cwd, sid):
         send(chat_id, "⏳ la sessione è ancora in sincronizzazione dal Mac, riprova tra qualche secondo.", thread_id=thread_id)
         return
+
+    # Ownership: sid seedato da publish/sync appartiene al Mac (owned=False) ->
+    # primo resume con --fork-session (id+file nuovi, locali); poi il fork è nostro.
+    fork = bool(sid) and not chat_state.get("owned", True)
 
     status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
 
@@ -1678,8 +1695,9 @@ def handle(msg: dict, state: dict) -> None:
             edit_status(chat_id, status_msg_id, label)
 
     with TypingPinger(chat_id, thread_id=thread_id):
-        reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort)
+        reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort, fork=fork)
     chat_state["session_id"] = new_sid
+    chat_state["owned"] = True  # da qui in poi la sessione (o il suo fork) è locale
     chat_state.setdefault("cwd", cwd)
     accumulate_usage(chat_state, meta)
     # sessione nuova nata qui (Telegram) → aggiungila al manifest Syncthing (sync verso il Mac)
