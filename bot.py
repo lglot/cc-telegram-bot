@@ -699,6 +699,23 @@ def manifest_add(cwd: str, sid: str) -> bool:
     return added
 
 
+def session_file_exists(cwd: str, sid: str) -> bool:
+    """True se il file sessione esiste localmente (post-sync Syncthing)."""
+    if not cwd or not sid:
+        return False
+    enc = _enc_cwd(normalize_cwd(cwd))
+    return (PROJECTS_DIR / enc / f"{sid}.jsonl").exists()
+
+
+def edit_forum_topic(chat_id: int, thread_id: int, name: str) -> bool:
+    try:
+        r = tg("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=name[:128])
+        return bool(r.get("ok"))
+    except Exception as e:
+        log(f"edit_forum_topic err: {e}")
+        return False
+
+
 def publish_target(state: dict) -> int | None:
     """Chat di destinazione dei topic publish.
 
@@ -739,6 +756,7 @@ def process_publish_queue(state: dict) -> None:
         uuid = req.get("uuid")
         cwd = normalize_cwd(req.get("cwd") or "")
         name = req.get("name") or nice_name(cwd)
+        recap = (req.get("recap") or "").strip()
         if not uuid or not cwd:
             os.remove(rp)
             continue
@@ -747,12 +765,30 @@ def process_publish_queue(state: dict) -> None:
             return  # lascia la richiesta in coda, riprova al prossimo giro
         reg = forum_reg(state, forum_id)
         topics = reg.setdefault("topics", {})
-        dk = _enc_cwd(cwd)
-        if dk in topics and topics[dk].get("thread_id"):
-            tid = topics[dk]["thread_id"]
-            topics[dk]["session_id"] = uuid
+        # topic per SESSIONE (chiave = uuid); migra eventuale entry legacy keyed per dir
+        entry = topics.get(uuid)
+        if entry is None:
+            dk = _enc_cwd(cwd)
+            legacy = topics.get(dk)
+            if legacy and legacy.get("session_id") == uuid:
+                entry = topics.pop(dk)
+                topics[uuid] = entry
+        # NB: i messaggi passano da send() che converte markdown -> HTML Telegram:
+        # qui si scrive SOLO markdown (mai tag HTML, verrebbero escapati e mostrati grezzi).
+        intro = (
+            f"🧵 **{name}**\n"
+            f"cwd: `{cwd}`\n"
+            f"sessione: `{uuid[:8]}`\n\n"
+            f"Scrivi qui per riprendere questa sessione (sincronizzata col Mac)."
+        )
+        if entry and entry.get("thread_id"):
+            tid = entry["thread_id"]
+            if name != entry.get("name") and edit_forum_topic(forum_id, tid, f"📂 {name}"):
+                entry["name"] = name
+            entry["session_id"] = uuid
+            entry["cwd"] = cwd
             state.setdefault(f"{forum_id}:{tid}", {})["session_id"] = uuid
-            send(forum_id, f"↻ <b>{_html.escape(name)}</b> ri-pubblicata (sessione {uuid[:8]}).", thread_id=tid)
+            send(forum_id, f"↻ ri-pubblicata: **{name}** (sessione `{uuid[:8]}`).", thread_id=tid)
         else:
             color = TOPIC_COLORS[len(topics) % len(TOPIC_COLORS)]
             tid, err = create_forum_topic(forum_id, f"📂 {name}", icon_color=color)
@@ -761,18 +797,13 @@ def process_publish_queue(state: dict) -> None:
                     send(aid, f"❌ publish '{name}' fallita: {err}\n(topics privati abilitati via BotFather? in un gruppo serve admin con Manage Topics)")
                 os.remove(rp)
                 continue
-            topics[dk] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": uuid}
+            topics[uuid] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": uuid}
             cs = state.setdefault(f"{forum_id}:{tid}", {})
             cs["cwd"] = cwd
             cs["session_id"] = uuid
-            send(
-                forum_id,
-                f"🧵 <b>{_html.escape(name)}</b>\n"
-                f"cwd: <code>{_html.escape(cwd)}</code>\n"
-                f"sessione: <code>{uuid[:8]}</code>\n\n"
-                f"Scrivi qui per riprendere questa sessione (sincronizzata col Mac).",
-                thread_id=tid,
-            )
+            send(forum_id, intro, thread_id=tid)
+        if recap:
+            send(forum_id, f"📋 **Recap sessione**\n\n{recap}", thread_id=tid)
         save_state(state)
         os.remove(rp)
 
@@ -870,15 +901,15 @@ def do_sync(chat_id: int, state: dict) -> str:
         # intro nel nuovo topic
         send(
             chat_id,
-            f"🧵 <b>{_html.escape(proj['name'])}</b>\n"
-            f"cwd: <code>{_html.escape(proj['cwd'])}</code>\n"
-            f"sessione: <code>{proj['latest_sid'][:8]}</code> ({proj['n']} sessioni nel progetto)\n\n"
+            f"🧵 **{proj['name']}**\n"
+            f"cwd: `{proj['cwd']}`\n"
+            f"sessione: `{proj['latest_sid'][:8]}` ({proj['n']} sessioni nel progetto)\n\n"
             f"Scrivi qui per riprendere questa sessione Claude Code.",
             thread_id=tid,
         )
 
     save_state(state)
-    lines = [f"🔄 <b>Sync thread completato</b> — {len(topics)} topic mappati."]
+    lines = [f"🔄 **Sync thread completato**: {len(topics)} topic mappati."]
     if created:
         lines.append(f"✅ creati ({len(created)}): " + ", ".join(created))
     if updated:
@@ -897,7 +928,7 @@ def fmt_threads(state: dict, chat_id: int) -> str:
     lines = [f"🧵 {len(topics)} thread:"]
     for dk, t in topics.items():
         sid = (t.get("session_id") or "")[:8]
-        lines.append(f"• {t.get('name')} — sid {sid} — <code>{_html.escape(t.get('cwd',''))}</code>")
+        lines.append(f"• {t.get('name')} (sid {sid}) `{t.get('cwd','')}`")
     return "\n".join(lines)
 
 
@@ -1280,7 +1311,7 @@ def handle(msg: dict, state: dict) -> None:
             log(f"forum registrato chat_id={chat_id}")
             send(
                 chat_id,
-                "👋 Forum registrato. Pubblica una sessione dal Mac con <code>/remote-desktop</code>, "
+                "👋 Forum registrato. Pubblica una sessione dal Mac con `/remote-desktop`, "
                 "oppure scrivi qui per avviarne una nuova. (<code>/sync</code> per mappare i progetti già presenti.)",
             )
             return
@@ -1576,6 +1607,13 @@ def handle(msg: dict, state: dict) -> None:
     model = chat_state.get("model", MODEL) or None
     effort = chat_state.get("effort", DEFAULT_EFFORT) or None
     summary = chat_state.pop("compact_summary", None)
+
+    # Sessione pubblicata ma file non ancora arrivato via Syncthing: rispondi
+    # chiaro invece di lanciare un resume che fallirebbe con error_during_execution.
+    # NON resettare session_id: al prossimo messaggio il file sarà arrivato.
+    if sid and not session_file_exists(cwd, sid):
+        send(chat_id, "⏳ la sessione è ancora in sincronizzazione dal Mac, riprova tra qualche secondo.", thread_id=thread_id)
+        return
 
     status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
 
