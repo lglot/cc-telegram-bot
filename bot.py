@@ -734,6 +734,91 @@ def publish_target(state: dict) -> int | None:
     return None
 
 
+def _apply_session_patches(patches: dict) -> list[str]:
+    """Applica i git patch (format-patch) dei commit della sessione nei repo locali.
+
+    patches: {repo_dirname: "<format-patch concatenato>"}. Path repo: ~/code/<repo>
+    (canonicalizzato via normalize_cwd per il bind mount lgcloud). Ritorna righe di
+    report da postare nel topic. Non solleva: i fallimenti diventano righe ⚠️.
+    """
+    report: list[str] = []
+    for repo, patchtext in (patches or {}).items():
+        if not patchtext:
+            continue
+        repo_dir = normalize_cwd(os.path.expanduser(f"~/code/{repo}"))
+        if not os.path.isdir(os.path.join(repo_dir, ".git")):
+            report.append(f"⚠️ {repo}: repo non trovato in {repo_dir}")
+            continue
+        try:
+            p = subprocess.run(
+                ["git", "-C", repo_dir, "am", "--3way", "--keep-cr"],
+                input=patchtext, capture_output=True, text=True,
+            )
+            if p.returncode == 0:
+                report.append(f"✅ {repo}: patch applicate")
+            else:
+                subprocess.run(["git", "-C", repo_dir, "am", "--abort"], capture_output=True, text=True)
+                report.append(f"⚠️ {repo}: git am fallito ({(p.stderr or p.stdout).strip()[:90]})")
+        except Exception as e:
+            report.append(f"⚠️ {repo}: {str(e)[:90]}")
+    return report
+
+
+def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
+    """Variant 'handoff-seed' (da claude-handoff-publish): NON riprende la sessione
+    del Mac, ne avvia una NUOVA su lgcloud seedata dall'handoff. Applica i patch dei
+    commit della sessione, crea il topic, lancia claude una volta e posta la risposta.
+    """
+    cwd = normalize_cwd(req.get("cwd") or "") or CWD
+    name = req.get("name") or nice_name(cwd)
+    doc = (req.get("handoff_doc") or "").strip()
+    patches = req.get("patches") or {}
+
+    patch_report = _apply_session_patches(patches)
+
+    reg = forum_reg(state, forum_id)
+    topics = reg.setdefault("topics", {})
+    color = TOPIC_COLORS[len(topics) % len(TOPIC_COLORS)]
+    tid, err = create_forum_topic(forum_id, f"🤝 {name}", icon_color=color)
+    if tid is None:
+        for aid in ALLOW:
+            send(aid, f"❌ handoff-seed '{name}' fallita: {err}")
+        return
+    skey = f"{forum_id}:{tid}"
+    cs = state.setdefault(skey, {})
+    cs["cwd"] = cwd
+    cs["owned"] = True  # sessione nata su lgcloud (no fork)
+    mode = cs.get("mode", DEFAULT_MODE)
+    model = cs.get("model", MODEL) or None
+    eff = cs.get("effort", DEFAULT_EFFORT) or None
+    topics[f"handoff-{tid}"] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": None}
+    save_state(state)
+
+    header = f"🤝 **{name}**\ncwd: `{cwd}`"
+    if patch_report:
+        header += "\n" + "\n".join(patch_report)
+    send(forum_id, header, thread_id=tid)
+    if doc:
+        send(forum_id, f"📋 **Handoff**\n\n{doc[:3500]}", thread_id=tid)
+
+    prompt = (
+        f"{doc}\n\n---\n"
+        "Questo è l'handoff della sessione precedente, che continui ORA su lgcloud. "
+        "I commit della sessione sono già applicati nei repo locali. Verifica lo stato "
+        "e procedi col primo dei prossimi step; rispondi con cosa hai trovato e cosa fai."
+    )
+    status_id = send_status(forum_id, "🚀 avvio la sessione su lgcloud…", thread_id=tid)
+    reply, new_sid, meta = run_claude_streaming(prompt, None, mode, cwd, model, effort=eff)
+    if status_id is not None:
+        delete_message(forum_id, status_id)
+    if new_sid:
+        cs["session_id"] = new_sid
+        manifest_add(cwd, new_sid)
+    accumulate_usage(cs, meta)
+    save_state(state)
+    send(forum_id, reply or "(nessuna risposta)", thread_id=tid)
+
+
 def process_publish_queue(state: dict) -> None:
     """Scansiona PUBLISH_DIR: per ogni richiesta crea+binda un topic.
 
@@ -751,6 +836,17 @@ def process_publish_queue(state: dict) -> None:
         try:
             req = json.loads(Path(rp).read_text())
         except Exception:
+            os.remove(rp)
+            continue
+        if req.get("variant") == "handoff-seed":
+            if forum_id is None:
+                return  # nessuna destinazione: lascia in coda, riprova dopo
+            try:
+                _process_handoff_seed(req, forum_id, state)
+            except Exception as e:
+                log(f"handoff-seed err: {e}")
+                for aid in ALLOW:
+                    send(aid, f"❌ handoff-seed '{req.get('name')}' fallita: {e}")
             os.remove(rp)
             continue
         uuid = req.get("uuid")
