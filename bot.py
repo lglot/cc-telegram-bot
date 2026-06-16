@@ -221,7 +221,10 @@ def md_to_tg_html(text: str) -> str:
 
     # blocchi code ```lang\n...\n```
     def repl_pre(m: _re.Match) -> str:
+        lang = m.group(1) or ""
         body = m.group(2) or ""
+        if lang:
+            return stash(f'<pre><code class="language-{lang}">{_html.escape(body)}</code></pre>')
         return stash(f"<pre>{_html.escape(body)}</pre>")
 
     text = _re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", repl_pre, text, flags=_re.DOTALL)
