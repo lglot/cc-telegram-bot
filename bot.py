@@ -71,7 +71,7 @@ MODEL_CONTEXT_WINDOW = {
     "claude-sonnet-4-6": 1_000_000,
     "claude-haiku-4-5": 200_000,
 }
-CONTEXT_WARN_PCT = float(os.environ.get("CC_CONTEXT_WARN_PCT", "0.5"))
+CONTEXT_WARN_PCT = float(os.environ.get("CC_CONTEXT_WARN_PCT", "0.8"))
 
 
 def context_window_for(model: str | None) -> int:
@@ -463,9 +463,10 @@ def delete_message(chat_id: int, message_id: int) -> None:
         log(f"delete_message err: {e}")
 
 
-def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]], thread_id: int | None = None) -> int | None:
+def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]], thread_id: int | None = None, parse_mode: str = "") -> int | None:
     """Invia messaggio con inline_keyboard. `keyboard` è array di righe di bottoni
-    {text, callback_data}. Niente HTML parse_mode (i bottoni sostituiscono il formatting).
+    {text, callback_data}. `parse_mode` opzionale (es. "HTML" per il thinking in
+    corsivo nella bolla live); il testo va passato già formattato dal chiamante.
     """
     try:
         params = {
@@ -474,6 +475,8 @@ def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]], thre
             "disable_web_page_preview": "true",
             "reply_markup": json.dumps({"inline_keyboard": keyboard}),
         }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         _thread_param(params, thread_id)
         r = tg("sendMessage", **params)
         if r.get("ok"):
@@ -483,7 +486,7 @@ def send_with_keyboard(chat_id: int, text: str, keyboard: list[list[dict]], thre
     return None
 
 
-def edit_message_with_keyboard(chat_id: int, message_id: int, text: str, keyboard: list[list[dict]] | None) -> None:
+def edit_message_with_keyboard(chat_id: int, message_id: int, text: str, keyboard: list[list[dict]] | None, parse_mode: str = "") -> None:
     try:
         params = {
             "chat_id": chat_id,
@@ -491,6 +494,8 @@ def edit_message_with_keyboard(chat_id: int, message_id: int, text: str, keyboar
             "text": text[:TG_LIMIT],
             "disable_web_page_preview": "true",
         }
+        if parse_mode:
+            params["parse_mode"] = parse_mode
         if keyboard is not None:
             params["reply_markup"] = json.dumps({"inline_keyboard": keyboard})
         tg("editMessageText", **params)

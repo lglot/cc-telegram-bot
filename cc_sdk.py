@@ -74,6 +74,11 @@ class Turn:
         self.final_result: str | None = None
         self.is_error = False
         self.error_text = ""
+        # Occupazione contesto = input dell'ULTIMA chiamata API del turno
+        # (message_start.usage). NON la somma cumulativa della usage del
+        # ResultMessage, che conta tutte le chiamate del turno (ogni tool-call
+        # rimanda il contesto → cache_read sommata N volte → % assurde tipo 555%).
+        self.input_context_tokens = 0
 
     @property
     def accumulated(self) -> str:
@@ -96,6 +101,7 @@ async def _drive(
     turn = Turn()
     on_status = callbacks.get("on_status")
     on_text = callbacks.get("on_text")
+    on_text_block = callbacks.get("on_text_block")
     on_thinking = callbacks.get("on_thinking")
     on_tool = callbacks.get("on_tool")
     on_tool_result = callbacks.get("on_tool_result")
@@ -178,7 +184,18 @@ async def _drive(
 
             elif isinstance(msg, StreamEvent):
                 ev = msg.event or {}
-                if ev.get("type") == "content_block_delta":
+                if ev.get("type") == "message_start":
+                    # usage della singola chiamata: input + cache. Sovrascrive a
+                    # ogni chiamata → resta quella dell'ultima (= occupazione attuale).
+                    u = ((ev.get("message") or {}).get("usage")) or {}
+                    s = (
+                        (u.get("input_tokens") or 0)
+                        + (u.get("cache_read_input_tokens") or 0)
+                        + (u.get("cache_creation_input_tokens") or 0)
+                    )
+                    if s:
+                        turn.input_context_tokens = s
+                elif ev.get("type") == "content_block_delta":
                     delta = ev.get("delta") or {}
                     dt = delta.get("type")
                     if dt == "text_delta":
@@ -214,6 +231,13 @@ async def _drive(
                     elif isinstance(block, TextBlock):
                         if (block.text or "").strip():
                             turn.last_block_text = block.text
+                            # blocco testo completo → committalo come messaggio
+                            # persistente (il rendering live lo mostra separato).
+                            if on_text_block:
+                                try:
+                                    on_text_block(block.text)
+                                except Exception:
+                                    pass
 
             elif isinstance(msg, UserMessage):
                 for block in (msg.content or []):
@@ -233,10 +257,11 @@ async def _drive(
                 turn.final_result = msg.result
                 turn.is_error = bool(msg.is_error)
                 u = msg.usage or {}
-                # Footprint del contesto in questo turno = quanto è stato mandato
-                # al modello (input nuovo + cache letta + cache scritta). Approssima
-                # l'occupazione corrente della finestra di contesto.
-                ctx_tokens = (
+                # Occupazione corrente del contesto = input dell'ultima chiamata
+                # (catturato dai message_start). La usage del ResultMessage è
+                # cumulativa sul turno → NON usabile come dimensione finestra.
+                # Fallback alla cumulativa solo se nessun message_start visto.
+                ctx_tokens = turn.input_context_tokens or (
                     (u.get("input_tokens") or 0)
                     + (u.get("cache_read_input_tokens") or 0)
                     + (u.get("cache_creation_input_tokens") or 0)
@@ -269,6 +294,7 @@ def run_turn(
     *,
     on_status: "Callable[[str], None] | None" = None,
     on_text: "Callable[[str], None] | None" = None,
+    on_text_block: "Callable[[str], None] | None" = None,
     on_thinking: "Callable[[str], None] | None" = None,
     on_tool: "Callable[[dict], None] | None" = None,
     on_tool_result: "Callable[[dict], None] | None" = None,
@@ -293,6 +319,7 @@ def run_turn(
     callbacks = {
         "on_status": on_status,
         "on_text": on_text,
+        "on_text_block": on_text_block,
         "on_thinking": on_thinking,
         "on_tool": on_tool,
         "on_tool_result": on_tool_result,

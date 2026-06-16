@@ -1,8 +1,16 @@
 """cc_live — rendering live di un turno SDK su Telegram.
 
 Glue tra i callback di `cc_sdk.run_turn` e l'I/O Telegram di `bot.py`.
-Tiene isolata la logica di: streaming testo (edit throttlato del messaggio),
-display tool/thinking/todo, bottone Stop, approvazione interattiva (ask-mode).
+
+Modello di rendering (stile Claude Code CLI):
+- Ogni blocco di testo di Claude (`on_text_block`) diventa un messaggio
+  PERSISTENTE separato → la storia della chat resta navigabile.
+- Una sola bolla live EFFIMERA (con bottone Stop) mostra "cosa sta succedendo
+  ora": il thinking in corsivo, lo status dei tool, l'anteprima del testo in
+  streaming. Dopo ogni commit la bolla viene rimossa e ricreata in coda alla
+  chat (così l'indicatore "ora" resta sotto la storia, come il cursore CLI).
+- Il thinking è l'UNICA cosa effimera "voluta": appare in corsivo nella bolla
+  mentre il modello ragiona e sparisce appena arriva testo/azione reale.
 
 `bot.py` passa un namespace `tg` con le sue funzioni I/O (dependency injection,
 niente import circolari) e gestisce i callback dei bottoni chiamando
@@ -11,6 +19,7 @@ niente import circolari) e gestisce i callback dei bottoni chiamando
 
 from __future__ import annotations
 
+import html as _html
 import threading
 import time
 from types import SimpleNamespace
@@ -18,8 +27,9 @@ from typing import Any
 
 import cc_sdk
 
-MIN_EDIT_INTERVAL = 1.2     # s minimi tra due edit del messaggio live (rate limit TG)
-LIVE_TAIL = 3500            # char max mostrati nel messaggio live (coda del testo)
+MIN_EDIT_INTERVAL = 1.2     # s minimi tra due edit della bolla live (rate limit TG)
+LIVE_TAIL = 3500            # char max mostrati nella bolla live (coda del testo)
+THINK_TAIL = 700           # char max di thinking mostrati nella bolla live
 PERM_TIMEOUT = 300          # s di attesa approvazione prima del deny implicito
 
 # Registry condivisi con bot.handle_callback ------------------------------------
@@ -85,7 +95,7 @@ def run_live_turn(
     images: "list[str] | None" = None,
     timeout_s: int = 1800,
     context_window: int = 200_000,
-    warn_pct: float = 0.5,
+    warn_pct: float = 0.8,
 ) -> tuple[str, str | None, dict]:
     """Esegue un turno SDK con rendering live su Telegram.
 
@@ -100,59 +110,94 @@ def run_live_turn(
         _CANCELS[turn_token] = cancel_event
 
     stop_kb = [[{"text": "⏹ Stop", "callback_data": f"stop:{turn_token}"}]]
-    live_id = tg.send_with_keyboard(chat_id, "💭 avvio…", stop_kb, thread_id=thread_id)
 
     state = {
-        "header": "💭 ragionamento…",
-        "body": [],          # delta testo
-        "thinking": [],      # delta thinking (mostrati solo prima del testo)
+        "live_id": None,      # id bolla live corrente (None = da (ri)creare in coda)
+        "header": "💭 avvio…",
+        "seg": [],            # delta testo del segmento corrente (anteprima live)
+        "thinking": [],       # delta thinking della fase corrente (corsivo, effimero)
         "todos": "",
         "last_edit": 0.0,
         "last_render": "",
-        "compacted": False,  # True se è scattata l'auto-compattazione nel turno
+        "any_text": False,    # almeno un blocco di testo committato come persistente
+        "compacted": False,   # True se è scattata l'auto-compattazione nel turno
     }
 
-    def _render() -> str:
-        body = "".join(state["body"])
+    def _render() -> tuple[str, str]:
+        """Ritorna (testo, parse_mode) per la bolla live."""
+        seg = "".join(state["seg"])
+        # Fase di ragionamento: nessun testo ancora, mostra il thinking in corsivo.
+        if not seg.strip() and state["thinking"]:
+            tail = "".join(state["thinking"])[-THINK_TAIL:]
+            return ("🧠 <i>" + _html.escape(tail) + "</i>", "HTML")
         parts = [state["header"]]
         if state["todos"]:
             parts.append(state["todos"])
-        if body.strip():
-            tail = body[-LIVE_TAIL:]
-            if len(body) > LIVE_TAIL:
+        if seg.strip():
+            tail = seg[-LIVE_TAIL:]
+            if len(seg) > LIVE_TAIL:
                 tail = "…" + tail
             parts.append(tail)
-        elif state["thinking"]:
-            think = "".join(state["thinking"])[-600:]
-            parts.append("🧠 " + think)
-        return "\n\n".join(p for p in parts if p)
+        return ("\n\n".join(p for p in parts if p), "")
 
     def _flush(force: bool = False) -> None:
-        if live_id is None:
-            return
         now = time.time()
         if not force and (now - state["last_edit"]) < MIN_EDIT_INTERVAL:
             return
-        text = _render()
-        if text == state["last_render"]:
+        text, pm = _render()
+        if not text.strip():
+            return
+        key = f"{pm}\x00{text}"
+        if key == state["last_render"]:
             return
         state["last_edit"] = now
-        state["last_render"] = text
-        tg.edit_message_with_keyboard(chat_id, live_id, text, stop_kb)
+        state["last_render"] = key
+        if state["live_id"] is None:
+            # (ri)crea la bolla in coda alla chat, sotto la storia committata
+            state["live_id"] = tg.send_with_keyboard(
+                chat_id, text, stop_kb, thread_id=thread_id, parse_mode=pm
+            )
+        else:
+            tg.edit_message_with_keyboard(chat_id, state["live_id"], text, stop_kb, parse_mode=pm)
+
+    def _drop_live() -> None:
+        if state["live_id"] is not None:
+            tg.delete_message(chat_id, state["live_id"])
+            state["live_id"] = None
+        state["last_render"] = ""
+
+    def _commit(text: str) -> None:
+        """Invia `text` come messaggio persistente e rimuove la bolla live.
+        La bolla verrà ricreata in coda al prossimo contenuto (ordine CLI:
+        storia sopra, indicatore 'ora' sotto)."""
+        if text and text.strip():
+            tg.send(chat_id, text, thread_id=thread_id)
+            state["any_text"] = True
+        state["seg"] = []
+        state["thinking"] = []
+        state["header"] = "💭 …"
+        _drop_live()
 
     # --- callbacks cc_sdk ---
     def on_text(delta: str) -> None:
-        state["body"].append(delta)
+        if state["thinking"]:
+            state["thinking"] = []   # il ragionamento è finito, ora si scrive
+        state["seg"].append(delta)
         _flush()
 
+    def on_text_block(text: str) -> None:
+        _commit(text)
+
     def on_thinking(delta: str) -> None:
+        if state["seg"]:
+            return                   # già in scrittura: ignora il thinking residuo
         state["thinking"].append(delta)
-        if not state["body"]:
-            state["header"] = "🧠 sto ragionando…"
-            _flush()
+        _flush()
 
     def on_status(label: str) -> None:
         state["header"] = label
+        if not label.startswith("💭"):
+            state["thinking"] = []   # status di tool/azione → esci dal ragionamento
         _flush(force=True)
 
     def on_todos(items: list) -> None:
@@ -160,9 +205,7 @@ def run_live_turn(
         _flush(force=True)
 
     def on_plan(plan_text: str) -> None:
-        state["header"] = "📐 piano proposto"
-        state["body"].append("\n\n" + (plan_text or ""))
-        _flush(force=True)
+        _commit("📐 Piano proposto\n\n" + (plan_text or ""))
 
     def on_compact(_info: dict) -> None:
         state["compacted"] = True
@@ -196,11 +239,15 @@ def run_live_turn(
                 pass
         return allowed
 
+    # bolla live iniziale (Stop disponibile subito)
+    _flush(force=True)
+
     try:
         reply, new_sid, meta = cc_sdk.run_turn(
             prompt, session_id, sdk_mode, cwd, model, effort, fork,
             on_status=on_status,
             on_text=on_text,
+            on_text_block=on_text_block,
             on_thinking=on_thinking,
             on_todos=on_todos,
             on_plan=on_plan,
@@ -213,13 +260,17 @@ def run_live_turn(
     finally:
         with _lock:
             _CANCELS.pop(turn_token, None)
-        if live_id is not None:
-            tg.delete_message(chat_id, live_id)
+        _drop_live()
 
-    if cancel_event.is_set() and not (reply or "").strip():
+    if cancel_event.is_set() and not state["any_text"] and not (reply or "").strip():
         reply = "⏹ interrotto"
 
-    # Note di contesto in coda alla risposta: compattazione + soglia finestra.
+    # Fallback: nessun blocco di testo committato durante il turno (solo tool,
+    # errore, o interruzione) → invia la reply finale come messaggio persistente.
+    if not state["any_text"] and (reply or "").strip():
+        tg.send(chat_id, reply, thread_id=thread_id)
+
+    # Note di contesto: compattazione + soglia finestra (messaggio a parte).
     notes = []
     if state.get("compacted"):
         notes.append("🗜 Auto-compattazione avvenuta: i turni più vecchi sono stati riassunti dal modello.")
@@ -230,9 +281,7 @@ def run_live_turn(
             f"⚠️ Contesto al {pct:.0%} ({ctx // 1000}k/{context_window // 1000}k token). "
             "Valuta /compact (reset con riassunto) o /handoff (nuovo topic)."
         )
-
-    final_text = reply or "(vuoto)"
     if notes:
-        final_text = f"{final_text}\n\n" + "\n".join(notes)
-    tg.send(chat_id, final_text, thread_id=thread_id)
+        tg.send(chat_id, "\n".join(notes), thread_id=thread_id)
+
     return reply, new_sid, meta
