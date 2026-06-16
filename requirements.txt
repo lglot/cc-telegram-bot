@@ -1,0 +1,5 @@
+# Core bot: solo stdlib (nessuna dipendenza obbligatoria).
+# Path SDK (CC_USE_SDK=1): richiede il Claude Agent SDK + anyio.
+# Installa in un venv e punta run.sh con PYTHON=/path/venv/bin/python nel .env.
+claude-agent-sdk>=0.2.102
+anyio>=4.0
