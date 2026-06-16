@@ -245,6 +245,12 @@ def md_to_tg_html(text: str) -> str:
     # escape il resto (quote=False: gli apostrofi non servono escapati nel testo)
     text = _html.escape(text, quote=False)
 
+    # auto-link bare URL (http/https) non già dentro un placeholder
+    def repl_url(m: _re.Match) -> str:
+        url = m.group(1)
+        return stash(f'<a href="{url}">{url}</a>')
+    text = _re.sub(r"(https?://[^\s<>\"']+)", repl_url, text)
+
     # bold **x** o __x__
     text = _re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", text)
     text = _re.sub(r"__([^_\n]+)__", r"<b>\1</b>", text)
