@@ -7,16 +7,36 @@ Telegram bridge for [Claude Code](https://docs.claude.com/en/docs/claude-code) r
 ## Features
 
 - **Per-chat session continuity** — first message starts a `claude` session, follow-ups resume it (`--resume <session_id>`)
-- **Streaming progress** — periodic status updates while Claude works (tool calls, elapsed time)
+- **Streaming progress** — periodic status updates while Claude works (tool calls, elapsed time). With the SDK engine: live token-by-token streaming, thinking/tool/todo display, and a Stop button
+- **Interactive permissions** (SDK engine) — `/ask on` makes mutating tools (Write/Edit/Bash/MCP) prompt for approval via inline buttons; read-only tools auto-approved
 - **Inline media** — Telegram photos/documents are downloaded and passed as file paths in the prompt
 - **Reply-to-quote** — `reply` to a message in Telegram and the quoted text is included as context
 - **Whitelist** — only configured `chat_id`s are allowed
 - **Self-restart on edit** — `touch bot.py` (or any edit) triggers `os.execv` after current turn flushes; sessions and offsets are preserved
 - **Telegram Markdown V2 output** with smart fallback if Claude emits malformed markup
 
+## Engines: CLI vs SDK
+
+The bot can drive Claude Code two ways:
+
+- **CLI** (default) — `subprocess` on `claude -p --output-format stream-json`. Zero extra deps (stdlib only).
+- **SDK** (`CC_USE_SDK=1`) — the [Claude Agent SDK](https://code.claude.com/docs/en/agent-sdk/overview) via `cc_sdk.py` + `cc_live.py`. Adds live text streaming, interactive tool permissions (`/ask`), thinking/todo display, and a Stop button. Runs on the same Claude Code login (subscription OAuth, no `ANTHROPIC_API_KEY` needed).
+
+Enabling the SDK engine:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt   # claude-agent-sdk + anyio
+# in .env:
+#   PYTHON=/abs/path/.venv/bin/python
+#   CC_USE_SDK=1
+```
+
+The import is defensive: if the SDK isn't installed, the bot falls back to the CLI engine (no crash). `/status` shows the active engine and `claude` version. Rollback: set `CC_USE_SDK=0` and restart.
+
 ## Requirements
 
-- Python 3.10+
+- Python 3.10+ (3.12 on the lgcloud deploy; needs `python3.12-venv` for the SDK engine)
 - [`claude` CLI](https://docs.claude.com/en/docs/claude-code) installed and authenticated (`claude` subprocess must be runnable as the bot's user)
 - Telegram bot token ([@BotFather](https://t.me/BotFather)) and your `chat_id` ([@userinfobot](https://t.me/userinfobot))
 
