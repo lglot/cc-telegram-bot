@@ -45,7 +45,7 @@ from pathlib import Path
 TOKEN = os.environ["TG_TOKEN"]
 ALLOW = {int(x) for x in os.environ["TG_ALLOW_CHAT_IDS"].split(",") if x.strip()}
 CWD = os.path.expanduser(os.environ.get("CC_CWD", "~"))
-MODEL = os.environ.get("CC_MODEL", "")
+MODEL = os.environ.get("CC_MODEL", "claude-opus-4-8")  # default: Opus 4.8
 TIMEOUT = int(os.environ.get("CC_TIMEOUT", "3600"))
 HEARTBEAT = int(os.environ.get("CC_HEARTBEAT", "120"))  # s tra update "sto lavorando"
 STATE_FILE = Path(os.path.expanduser(os.environ.get("STATE_FILE", "~/.cc-telegram-bot.state.json")))
@@ -60,6 +60,21 @@ MODEL_PRESETS = [
     ("Opus 4.7", "claude-opus-4-7"),
     ("Sonnet 4.6", "claude-sonnet-4-6"),
 ]
+# Finestra di contesto per model id (token). Fonte: catalogo modelli Claude.
+# Default conservativo per id sconosciuti.
+MODEL_CONTEXT_WINDOW = {
+    "claude-fable-5": 1_000_000,
+    "claude-opus-4-8": 1_000_000,
+    "claude-opus-4-7": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-haiku-4-5": 200_000,
+}
+CONTEXT_WARN_PCT = float(os.environ.get("CC_CONTEXT_WARN_PCT", "0.5"))
+
+
+def context_window_for(model: str | None) -> int:
+    return MODEL_CONTEXT_WINDOW.get(model or MODEL, 200_000)
 API = f"https://api.telegram.org/bot{TOKEN}"
 TG_LIMIT = 4000  # leave room for markup overhead
 
@@ -1299,11 +1314,17 @@ def run_claude_streaming(
             elif t == "result":
                 final_text = evt.get("result") or ""
                 new_sid = evt.get("session_id") or new_sid
+                _u = evt.get("usage") or {}
                 meta = {
-                    "usage": evt.get("usage") or {},
+                    "usage": _u,
                     "cost_usd": evt.get("total_cost_usd") or 0.0,
                     "duration_ms": evt.get("duration_ms") or 0,
                     "num_turns": evt.get("num_turns") or 0,
+                    "context_tokens": (
+                        (_u.get("input_tokens") or 0)
+                        + (_u.get("cache_read_input_tokens") or 0)
+                        + (_u.get("cache_creation_input_tokens") or 0)
+                    ),
                 }
                 if evt.get("is_error"):
                     final_text = f"❌ {final_text or evt.get('subtype', 'error')}"
@@ -1712,6 +1733,10 @@ def handle(msg: dict, state: dict) -> None:
             f"caveman: {'on' if cs.get('caveman') else 'off'}",
             f"engine: {'SDK' if (CC_USE_SDK and HAVE_SDK) else 'CLI'} · claude {claude_version()}",
         ]
+        ctx_tok = cs.get("last_context_tokens")
+        if ctx_tok:
+            win = context_window_for(model or MODEL)
+            lines.append(f"contesto: {ctx_tok // 1000}k/{win // 1000}k ({ctx_tok / win:.0%})")
         if thread_id is not None:
             lines.insert(0, f"thread: {thread_id}")
         if agg:
@@ -1947,6 +1972,7 @@ def handle(msg: dict, state: dict) -> None:
                 prompt=prompt, session_id=sid, sdk_mode=sdk_mode, cwd=cwd,
                 model=model, effort=effort, fork=fork,
                 chat_id=chat_id, thread_id=thread_id, ask=ask, timeout_s=TIMEOUT,
+                context_window=context_window_for(model), warn_pct=CONTEXT_WARN_PCT,
             )
     else:
         def update_status(label: str) -> None:
@@ -1959,6 +1985,8 @@ def handle(msg: dict, state: dict) -> None:
     chat_state["owned"] = True  # da qui in poi la sessione (o il suo fork) è locale
     chat_state.setdefault("cwd", cwd)
     accumulate_usage(chat_state, meta)
+    if meta.get("context_tokens"):
+        chat_state["last_context_tokens"] = meta["context_tokens"]
     # sessione nuova nata qui (Telegram) → aggiungila al manifest Syncthing (sync verso il Mac)
     if new_sid and new_sid != sid:
         manifest_add(cwd, new_sid)

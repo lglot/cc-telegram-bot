@@ -101,6 +101,7 @@ async def _drive(
     on_tool_result = callbacks.get("on_tool_result")
     on_todos = callbacks.get("on_todos")
     on_plan = callbacks.get("on_plan")
+    on_compact = callbacks.get("on_compact")
 
     pending_tools: dict[str, str] = {}
 
@@ -128,9 +129,22 @@ async def _drive(
             "permissionDecisionReason": "ask-mode (Telegram)",
         }}
 
-    hooks = None
+    # Hook PreCompact: scatta quando Claude Code sta per auto-compattare la
+    # sessione (contesto vicino al limite della finestra). Solo osservatore.
+    async def _pre_compact(input_data: dict, tool_use_id: str | None, context: Any):
+        if on_compact is not None:
+            try:
+                on_compact(input_data or {})
+            except Exception:
+                pass
+        return {}
+
+    hooks: dict = {}
     if ask_permission is not None and mode == "default":
-        hooks = {"PreToolUse": [HookMatcher(hooks=[_pre_tool])]}
+        hooks["PreToolUse"] = [HookMatcher(hooks=[_pre_tool])]
+    if on_compact is not None:
+        hooks["PreCompact"] = [HookMatcher(hooks=[_pre_compact])]
+    hooks = hooks or None
 
     options = ClaudeAgentOptions(
         permission_mode=mode,                         # bypassPermissions|default|plan|acceptEdits
@@ -218,11 +232,21 @@ async def _drive(
                 turn.session_id = msg.session_id or turn.session_id
                 turn.final_result = msg.result
                 turn.is_error = bool(msg.is_error)
+                u = msg.usage or {}
+                # Footprint del contesto in questo turno = quanto è stato mandato
+                # al modello (input nuovo + cache letta + cache scritta). Approssima
+                # l'occupazione corrente della finestra di contesto.
+                ctx_tokens = (
+                    (u.get("input_tokens") or 0)
+                    + (u.get("cache_read_input_tokens") or 0)
+                    + (u.get("cache_creation_input_tokens") or 0)
+                )
                 turn.meta = {
-                    "usage": msg.usage or {},
+                    "usage": u,
                     "cost_usd": msg.total_cost_usd or 0.0,
                     "duration_ms": msg.duration_ms or 0,
                     "num_turns": msg.num_turns or 0,
+                    "context_tokens": ctx_tokens,
                 }
                 if msg.is_error and not (msg.result or "").strip():
                     turn.error_text = f"❌ {msg.subtype or 'error'}"
@@ -250,6 +274,7 @@ def run_turn(
     on_tool_result: "Callable[[dict], None] | None" = None,
     on_todos: "Callable[[list], None] | None" = None,
     on_plan: "Callable[[str], None] | None" = None,
+    on_compact: "Callable[[dict], None] | None" = None,
     ask_permission: "Callable[[str, dict, str], bool] | None" = None,
     images: "list[str] | None" = None,
     cancel_event: "threading.Event | None" = None,
@@ -273,6 +298,7 @@ def run_turn(
         "on_tool_result": on_tool_result,
         "on_todos": on_todos,
         "on_plan": on_plan,
+        "on_compact": on_compact,
     }
 
     turn: Turn = anyio.run(

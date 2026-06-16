@@ -84,6 +84,8 @@ def run_live_turn(
     ask: bool,
     images: "list[str] | None" = None,
     timeout_s: int = 1800,
+    context_window: int = 200_000,
+    warn_pct: float = 0.5,
 ) -> tuple[str, str | None, dict]:
     """Esegue un turno SDK con rendering live su Telegram.
 
@@ -107,6 +109,7 @@ def run_live_turn(
         "todos": "",
         "last_edit": 0.0,
         "last_render": "",
+        "compacted": False,  # True se è scattata l'auto-compattazione nel turno
     }
 
     def _render() -> str:
@@ -161,6 +164,11 @@ def run_live_turn(
         state["body"].append("\n\n" + (plan_text or ""))
         _flush(force=True)
 
+    def on_compact(_info: dict) -> None:
+        state["compacted"] = True
+        state["header"] = "🗜 auto-compattazione contesto…"
+        _flush(force=True)
+
     # --- approvazione interattiva ---
     def ask_permission(name: str, tool_input: dict, summary: str) -> bool:
         token = _new_token("p")
@@ -196,6 +204,7 @@ def run_live_turn(
             on_thinking=on_thinking,
             on_todos=on_todos,
             on_plan=on_plan,
+            on_compact=on_compact,
             ask_permission=(ask_permission if ask else None),
             images=images,
             cancel_event=cancel_event,
@@ -209,5 +218,21 @@ def run_live_turn(
 
     if cancel_event.is_set() and not (reply or "").strip():
         reply = "⏹ interrotto"
-    tg.send(chat_id, reply or "(vuoto)", thread_id=thread_id)
+
+    # Note di contesto in coda alla risposta: compattazione + soglia finestra.
+    notes = []
+    if state.get("compacted"):
+        notes.append("🗜 Auto-compattazione avvenuta: i turni più vecchi sono stati riassunti dal modello.")
+    ctx = (meta or {}).get("context_tokens") or 0
+    if ctx and context_window and (ctx / context_window) >= warn_pct:
+        pct = ctx / context_window
+        notes.append(
+            f"⚠️ Contesto al {pct:.0%} ({ctx // 1000}k/{context_window // 1000}k token). "
+            "Valuta /compact (reset con riassunto) o /handoff (nuovo topic)."
+        )
+
+    final_text = reply or "(vuoto)"
+    if notes:
+        final_text = f"{final_text}\n\n" + "\n".join(notes)
+    tg.send(chat_id, final_text, thread_id=thread_id)
     return reply, new_sid, meta
