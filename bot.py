@@ -734,34 +734,36 @@ def publish_target(state: dict) -> int | None:
     return None
 
 
-def _apply_session_patches(patches: dict) -> list[str]:
-    """Applica i git patch (format-patch) dei commit della sessione nei repo locali.
+def _stage_session_patches(patches: dict, slug: str) -> tuple[str, list[str]]:
+    """Deposita i git patch (format-patch) dei commit della sessione come file, per
+    le "operazioni preliminari" dell'handoff (clone/checkout repo, poi `git am`).
 
-    patches: {repo_dirname: "<format-patch concatenato>"}. Path repo: ~/code/<repo>
-    (canonicalizzato via normalize_cwd per il bind mount lgcloud). Ritorna righe di
-    report da postare nel topic. Non solleva: i fallimenti diventano righe ⚠️.
+    patches: {repo_dirname: "<format-patch concatenato>"}. Scrive
+    ~/cloud-handoff/<slug>/<repo>.patch. Ritorna (dir, report). NON applica nulla:
+    e' la sessione ricevente, seguendo l'handoff, a fare clone/checkout/git am
+    (il repo/branch base su lgcloud puo' differire dal worktree d'origine).
     """
+    safe = _re.sub(r"[^A-Za-z0-9._-]+", "-", slug).strip("-") or "session"
+    base = os.path.expanduser(f"~/cloud-handoff/{safe}")
     report: list[str] = []
-    for repo, patchtext in (patches or {}).items():
+    if not patches:
+        return base, report
+    try:
+        os.makedirs(base, exist_ok=True)
+    except Exception as e:
+        return base, [f"errore creazione {base}: {str(e)[:80]}"]
+    for repo, patchtext in patches.items():
         if not patchtext:
             continue
-        repo_dir = normalize_cwd(os.path.expanduser(f"~/code/{repo}"))
-        if not os.path.isdir(os.path.join(repo_dir, ".git")):
-            report.append(f"⚠️ {repo}: repo non trovato in {repo_dir}")
-            continue
+        path = os.path.join(base, f"{repo}.patch")
         try:
-            p = subprocess.run(
-                ["git", "-C", repo_dir, "am", "--3way", "--keep-cr"],
-                input=patchtext, capture_output=True, text=True,
-            )
-            if p.returncode == 0:
-                report.append(f"✅ {repo}: patch applicate")
-            else:
-                subprocess.run(["git", "-C", repo_dir, "am", "--abort"], capture_output=True, text=True)
-                report.append(f"⚠️ {repo}: git am fallito ({(p.stderr or p.stdout).strip()[:90]})")
+            with open(path, "w") as f:
+                f.write(patchtext)
+            ncommits = patchtext.count("\nFrom ") + (1 if patchtext.startswith("From ") else 0)
+            report.append(f"{repo}: {ncommits} commit -> {path}")
         except Exception as e:
-            report.append(f"⚠️ {repo}: {str(e)[:90]}")
-    return report
+            report.append(f"{repo}: errore deposito ({str(e)[:80]})")
+    return base, report
 
 
 def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
@@ -774,7 +776,7 @@ def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
     doc = (req.get("handoff_doc") or "").strip()
     patches = req.get("patches") or {}
 
-    patch_report = _apply_session_patches(patches)
+    patch_dir, patch_report = _stage_session_patches(patches, name)
 
     reg = forum_reg(state, forum_id)
     topics = reg.setdefault("topics", {})
@@ -796,16 +798,23 @@ def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
 
     header = f"🤝 **{name}**\ncwd: `{cwd}`"
     if patch_report:
-        header += "\n" + "\n".join(patch_report)
+        header += "\n📦 patch dei commit (per le operazioni preliminari, `git am`):\n" + "\n".join(patch_report)
     send(forum_id, header, thread_id=tid)
     if doc:
         send(forum_id, f"📋 **Handoff**\n\n{doc[:3500]}", thread_id=tid)
 
+    patch_note = (
+        f"I commit della sessione sono depositati come patch in `{patch_dir}` "
+        "(un file .patch per repo): applicali con `git am` dopo il checkout del branch, "
+        "come da Operazioni preliminari. "
+    ) if patch_report else ""
     prompt = (
         f"{doc}\n\n---\n"
-        "Questo è l'handoff della sessione precedente, che continui ORA su lgcloud. "
-        "I commit della sessione sono già applicati nei repo locali. Verifica lo stato "
-        "e procedi col primo dei prossimi step; rispondi con cosa hai trovato e cosa fai."
+        "Sei una NUOVA sessione su lgcloud che continua questo lavoro. "
+        "Esegui PRIMA le Operazioni preliminari dell'handoff per ricreare l'ambiente "
+        "(clone/fetch repo, checkout branch, applica i patch, avvia l'ambiente). "
+        + patch_note
+        + "Poi verifica lo stato e procedi col primo dei prossimi passi; rispondi con cosa hai fatto e cosa manca."
     )
     status_id = send_status(forum_id, "🚀 avvio la sessione su lgcloud…", thread_id=tid)
     reply, new_sid, meta = run_claude_streaming(prompt, None, mode, cwd, model, effort=eff)
