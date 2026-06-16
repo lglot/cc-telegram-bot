@@ -242,8 +242,8 @@ def md_to_tg_html(text: str) -> str:
 
     text = _re.sub(r"\[([^\]]+)\]\(([^)]+)\)", repl_link, text)
 
-    # escape il resto
-    text = _html.escape(text)
+    # escape il resto (quote=False: gli apostrofi non servono escapati nel testo)
+    text = _html.escape(text, quote=False)
 
     # bold **x** o __x__
     text = _re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", text)
@@ -307,10 +307,68 @@ def _thread_param(params: dict, thread_id: int | None) -> dict:
     return params
 
 
+_DIFF_FILE_THRESHOLD = 30  # righe: diff più grandi vengono inviati come file allegato
+
+
+def _extract_large_diffs(text: str) -> tuple[str, list[tuple[str, str]]]:
+    """Estrae blocchi ```diff con più di _DIFF_FILE_THRESHOLD righe.
+    Li sostituisce con un placeholder e restituisce (testo, [(filename, content), ...])."""
+    files: list[tuple[str, str]] = []
+    counter = [0]
+
+    def replacer(m: _re.Match) -> str:
+        lang = m.group(1) or ""
+        body = m.group(2) or ""
+        if lang == "diff" and body.count("\n") >= _DIFF_FILE_THRESHOLD:
+            counter[0] += 1
+            fname = f"changes-{counter[0]}.diff"
+            files.append((fname, body))
+            added = sum(1 for l in body.splitlines() if l.startswith("+") and not l.startswith("+++"))
+            removed = sum(1 for l in body.splitlines() if l.startswith("-") and not l.startswith("---"))
+            return f"📎 `{fname}` (+{added}/-{removed} righe)"
+        return m.group(0)
+
+    modified = _re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", replacer, text, flags=_re.DOTALL)
+    return modified, files
+
+
+def send_document(chat_id: int, filename: str, content: bytes, thread_id: int | None = None) -> None:
+    """Invia un file come allegato Telegram (sendDocument) via multipart/form-data."""
+    boundary = "TGBotBoundary42"
+
+    def field(name: str, value: str) -> bytes:
+        return f'--{boundary}\r\nContent-Disposition: form-data; name="{name}"\r\n\r\n{value}\r\n'.encode()
+
+    parts = [field("chat_id", str(chat_id))]
+    if thread_id is not None:
+        parts.append(field("message_thread_id", str(thread_id)))
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="document"; filename="{filename}"\r\nContent-Type: text/plain\r\n\r\n'.encode()
+        + content + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+
+    body = b"".join(parts)
+    req = urllib.request.Request(
+        f"{API}/sendDocument",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30):
+            pass
+    except Exception as e:
+        log(f"send_document err: {e}")
+
+
 def send(chat_id: int, text: str, parse_mode: str = "HTML", thread_id: int | None = None) -> int | None:
     """Invia messaggio (split safe). Fallback plain text se HTML rotto."""
     if not text:
         return None
+    # diff grandi → file allegato prima del testo
+    text, diff_files = _extract_large_diffs(text)
+    for fname, content in diff_files:
+        send_document(chat_id, fname, content.encode(), thread_id=thread_id)
     last_id = None
     formatted = md_to_tg_html(text) if parse_mode == "HTML" else text
     for chunk in _split_safe(formatted, TG_LIMIT):
