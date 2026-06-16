@@ -144,6 +144,31 @@ Delete the file (or specific keys) to force fresh sessions.
 - Claude inherits the bot user's filesystem permissions — same as running `claude` interactively. Don't run as root.
 - Inline media is downloaded into a per-chat tmp dir and the path is passed to Claude. Claude can read the file. Vet your allowlist.
 
+## Mini App (cc-webapp)
+
+A Telegram Mini App is available as an **additional client** alongside the polling
+bot — richer chat UI, markdown rendering, native Telegram theme, and phone sensors
+(geolocation). It does **not** replace the bot; both drive the same Claude Agent SDK.
+
+- **Process**: separate service `webapp/server.py` (Starlette + SSE + uvicorn),
+  reuses `cc_sdk.run_turn` and streams tokens to the SPA. Runs as its own
+  systemd unit (`webapp/cc-webapp.service`), independent from `bot.py` and its
+  self-restart-on-edit. Binds `0.0.0.0:8099` by default.
+- **Auth**: each request carries Telegram `initData`, validated server-side with
+  HMAC-SHA256 (bot token) + `user.id ∈ TG_ALLOW_CHAT_IDS`. No Authelia/cookies
+  (would break the webview); `index.html` is inert, every `/api/*` needs valid initData.
+- **Exposure**: `cc.lgser.me` → Cloudflare (wildcard) → SWAG → tailnet → lgcloud:8099.
+  SWAG `cc.subdomain.conf` uses a dedicated SSE location (`/api/chat`: no buffering,
+  1h timeouts).
+- **Launch**: `setChatMenuButton` (menu button next to the input, private chat) and
+  the `/app` command. Config via `WEBAPP_*` env (see `.env.example`).
+
+```bash
+# install / run the webapp service
+cp webapp/cc-webapp.service ~/.config/systemd/user/
+systemctl --user daemon-reload && systemctl --user enable --now cc-webapp
+```
+
 ## License
 
 MIT — see [LICENSE](LICENSE).

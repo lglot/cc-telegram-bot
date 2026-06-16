@@ -1,0 +1,14 @@
+[Unit]
+Description=cc-webapp (Telegram Mini App for Claude Code)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/luigi/code/cc-telegram-bot
+ExecStart=/home/luigi/code/cc-telegram-bot/run-webapp.sh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

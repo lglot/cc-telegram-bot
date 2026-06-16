@@ -52,6 +52,7 @@ STATE_FILE = Path(os.path.expanduser(os.environ.get("STATE_FILE", "~/.cc-telegra
 DEFAULT_MODE = os.environ.get("CC_DEFAULT_MODE", "bypassPermissions")  # plan|acceptEdits|bypassPermissions
 VALID_MODES = {"plan", "acceptEdits", "bypassPermissions"}
 DEFAULT_EFFORT = os.environ.get("CC_DEFAULT_EFFORT", "")  # vuoto = default CC
+WEBAPP_URL = os.environ.get("WEBAPP_URL", "https://cc.lgser.me")  # Mini App (cc-webapp.service)
 VALID_EFFORTS = {"low", "medium", "high", "xhigh", "max"}
 EFFORT_ORDER = ["low", "medium", "high", "xhigh", "max"]
 MODEL_PRESETS = [
@@ -148,6 +149,7 @@ def acquire_singleton_lock() -> None:
 
 BOT_COMMANDS = [
     {"command": "help", "description": "Mostra comandi disponibili"},
+    {"command": "app", "description": "Apri la Mini App (chat grafica + sensori)"},
     {"command": "new", "description": "Resetta sessione Claude"},
     {"command": "status", "description": "Info sessione corrente"},
     {"command": "usage", "description": "% utilizzo piano CC (5h/7g/sonnet/opus)"},
@@ -714,6 +716,23 @@ def set_my_commands() -> None:
         log(f"setMyCommands ok ({len(BOT_COMMANDS)} cmd)")
     except Exception as e:
         log(f"setMyCommands err: {e}")
+
+
+def set_menu_button() -> None:
+    """Imposta il chat menu button globale come launcher della Mini App.
+    Visibile accanto all'input in chat privata (Telegram apre la webview con
+    initData firmato → cc-webapp valida e autentica)."""
+    if not WEBAPP_URL:
+        return
+    try:
+        tg("setChatMenuButton", menu_button=json.dumps({
+            "type": "web_app",
+            "text": "💬 Chat",
+            "web_app": {"url": WEBAPP_URL},
+        }))
+        log(f"setChatMenuButton ok ({WEBAPP_URL})")
+    except Exception as e:
+        log(f"setChatMenuButton err: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -1588,6 +1607,25 @@ def handle(msg: dict, state: dict) -> None:
             thread_id=thread_id,
         )
         return
+    if text == "/app":
+        chat_type = (msg.get("chat") or {}).get("type")
+        if chat_type == "private":
+            send_with_keyboard(
+                chat_id,
+                "💬 Apri la Mini App: chat con grafica + sensori (posizione). "
+                "È un client in più — sessione separata da questo thread.",
+                [[{"text": "💬 Apri chat", "web_app": {"url": WEBAPP_URL}}]],
+                thread_id=thread_id,
+            )
+        else:
+            send(
+                chat_id,
+                "💬 La Mini App si apre dalla <b>chat privata</b> col bot "
+                "(bottone menu accanto all'input, o /app lì). I web_app button "
+                "non sono ammessi nei gruppi.",
+                thread_id=thread_id,
+            )
+        return
     if text == "/sync":
         chat_type = (msg.get("chat") or {}).get("type")
         if chat_type != "private" and not is_forum_msg(msg):
@@ -2096,6 +2134,7 @@ def main() -> None:
     PUBLISH_DIR.mkdir(parents=True, exist_ok=True)
     log(f"bot start, allow={ALLOW}, cwd={CWD}, model={MODEL or '(default)'}, remap={REMAP_FROM or '-'}->{REMAP_TO or '-'}, pid={os.getpid()}")
     set_my_commands()
+    set_menu_button()
     state = load_state()
     offset = int(state.get("_tg_offset", 0) or 0)
     backoff = 1
