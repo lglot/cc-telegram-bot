@@ -801,7 +801,10 @@ def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
         header += "\n📦 patch dei commit (per le operazioni preliminari, `git am`):\n" + "\n".join(patch_report)
     send(forum_id, header, thread_id=tid)
     if doc:
-        send(forum_id, f"📋 **Handoff**\n\n{doc[:3500]}", thread_id=tid)
+        # plain (parse_mode=""): l'handoff e' lungo e pieno di code-block; in HTML lo
+        # split tra <pre> e </pre> sbilancia i tag -> Telegram 400. Plain e' robusto e
+        # gia' leggibile; send() fa lo split-safe sui chunk.
+        send(forum_id, f"📋 Handoff\n\n{doc}", parse_mode="", thread_id=tid)
 
     patch_note = (
         f"I commit della sessione sono depositati come patch in `{patch_dir}` "
