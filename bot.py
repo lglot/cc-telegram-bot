@@ -39,6 +39,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+from types import SimpleNamespace
 from pathlib import Path
 
 TOKEN = os.environ["TG_TOKEN"]
@@ -61,6 +62,19 @@ MODEL_PRESETS = [
 ]
 API = f"https://api.telegram.org/bot{TOKEN}"
 TG_LIMIT = 4000  # leave room for markup overhead
+
+# --- Claude Agent SDK (path alternativo a subprocess `claude -p`) ---
+# Import difensivo: una dipendenza mancante (anyio/claude_agent_sdk) NON deve
+# crashare il bot. CC_USE_SDK=1 attiva il path SDK (streaming live, permessi
+# interattivi). Default off finché non verificato sul deploy.
+try:
+    import cc_live  # importa cc_sdk -> anyio, claude_agent_sdk
+    HAVE_SDK = True
+    _SDK_IMPORT_ERR = ""
+except Exception as _e:  # noqa: BLE001
+    HAVE_SDK = False
+    _SDK_IMPORT_ERR = str(_e)
+CC_USE_SDK = os.environ.get("CC_USE_SDK", "0") == "1"
 
 PROJECTS_DIR = Path(os.path.expanduser(os.environ.get("CC_PROJECTS_DIR", "~/.claude/projects")))
 SYNC_EXCLUDE = [
@@ -124,6 +138,7 @@ BOT_COMMANDS = [
     {"command": "usage", "description": "% utilizzo piano CC (5h/7g/sonnet/opus)"},
     {"command": "compact", "description": "Compatta sessione in riassunto"},
     {"command": "mode", "description": "Permission mode (default bypassPermissions)"},
+    {"command": "ask", "description": "Toggle approvazione tool interattiva (SDK)"},
     {"command": "effort", "description": "Effort level (low|medium|high|xhigh|max)"},
     {"command": "cwd", "description": "Mostra/cambia working directory"},
     {"command": "model", "description": "Mostra/cambia model id"},
@@ -516,6 +531,28 @@ def build_model_keyboard(current: str | None) -> list[list[dict]]:
     return rows
 
 
+_CLAUDE_VERSION_CACHE: str | None = None
+
+
+def claude_version() -> str:
+    """Versione del CLI claude (es. '2.1.178'), letta da `claude --version`.
+
+    Cache per processo. Evita lo User-Agent hardcoded che si disallinea ad ogni
+    update di Claude Code.
+    """
+    global _CLAUDE_VERSION_CACHE
+    if _CLAUDE_VERSION_CACHE is None:
+        ver = ""
+        try:
+            r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=5)
+            if r.returncode == 0 and r.stdout.strip():
+                ver = r.stdout.strip().split()[0]  # "2.1.178 (Claude Code)" -> "2.1.178"
+        except Exception as e:  # noqa: BLE001
+            log(f"claude_version err: {e}")
+        _CLAUDE_VERSION_CACHE = ver or "2.1.178"
+    return _CLAUDE_VERSION_CACHE
+
+
 def fetch_cc_usage() -> dict | None:
     """GET https://api.anthropic.com/api/oauth/usage usando OAuth token CC dal keychain.
 
@@ -550,7 +587,7 @@ def fetch_cc_usage() -> dict | None:
         headers={
             "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
-            "User-Agent": "claude-cli/2.0.40 (external, cli)",
+            "User-Agent": f"claude-cli/{claude_version()} (external, cli)",
             "anthropic-beta": "oauth-2025-04-20",
         },
     )
@@ -1515,6 +1552,7 @@ def handle(msg: dict, state: dict) -> None:
             "/usage — % utilizzo piano CC (5h, 7g)\n"
             "/compact — riassumi e ricomincia\n"
             "/mode [plan|acceptEdits|bypassPermissions] — permission mode\n"
+            "/ask [on|off] — approvazione tool interattiva (SDK): Write/Edit/Bash chiedono conferma\n"
             "/effort [low|medium|high|xhigh|max|reset] — effort level\n"
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
@@ -1670,7 +1708,9 @@ def handle(msg: dict, state: dict) -> None:
             f"mode: {mode}",
             f"model: {model or '(default)'}",
             f"effort: {eff or '(default)'}",
+            f"ask-mode: {'on' if cs.get('ask') else 'off'}",
             f"caveman: {'on' if cs.get('caveman') else 'off'}",
+            f"engine: {'SDK' if (CC_USE_SDK and HAVE_SDK) else 'CLI'} · claude {claude_version()}",
         ]
         if thread_id is not None:
             lines.insert(0, f"thread: {thread_id}")
@@ -1735,6 +1775,26 @@ def handle(msg: dict, state: dict) -> None:
         state.setdefault(skey, {})["mode"] = new_mode
         save_state(state)
         send(chat_id, f"🔐 mode → {new_mode}", thread_id=thread_id)
+        return
+    if text.startswith("/ask"):
+        parts = text.split(maxsplit=1)
+        cs = state.setdefault(skey, {})
+        if len(parts) == 1:
+            new_val = not cs.get("ask", False)
+        elif parts[1].strip().lower() in ("on", "off"):
+            new_val = parts[1].strip().lower() == "on"
+        else:
+            send(chat_id, "uso: /ask [on|off] (senza argomento = toggle)", thread_id=thread_id)
+            return
+        cs["ask"] = new_val
+        save_state(state)
+        if not (CC_USE_SDK and HAVE_SDK):
+            send(chat_id, "⚠️ ask-mode richiede il path SDK (CC_USE_SDK=1). Stato salvato ma non attivo.", thread_id=thread_id)
+            return
+        if new_val:
+            send(chat_id, "🔐 ask-mode ON — i tool che modificano (Write/Edit/Bash/MCP) chiederanno conferma con bottoni. Read-only auto-approvati.", thread_id=thread_id)
+        else:
+            send(chat_id, "🔓 ask-mode OFF — full-auto (bypassPermissions).", thread_id=thread_id)
         return
     if text.startswith("/effort"):
         parts = text.split(maxsplit=1)
@@ -1865,12 +1925,36 @@ def handle(msg: dict, state: dict) -> None:
     parts.append(f"[Nuovo messaggio]\n{text}")
     prompt = "\n\n".join(parts)
 
-    def update_status(label: str) -> None:
+    use_sdk = CC_USE_SDK and HAVE_SDK
+    ask = bool(chat_state.get("ask"))
+    if use_sdk:
+        # cc_live possiede un proprio messaggio live (streaming + Stop) e invia
+        # la reply finale; il messaggio "avvio" qui non serve.
         if status_msg_id is not None:
-            edit_status(chat_id, status_msg_id, label)
+            delete_message(chat_id, status_msg_id)
+            status_msg_id = None
+        sdk_mode = "default" if ask else mode
+        tg_api = SimpleNamespace(
+            send=send,
+            send_with_keyboard=send_with_keyboard,
+            edit_message_with_keyboard=edit_message_with_keyboard,
+            delete_message=delete_message,
+            answer_callback=answer_callback,
+        )
+        with TypingPinger(chat_id, thread_id=thread_id):
+            reply, new_sid, meta = cc_live.run_live_turn(
+                tg_api,
+                prompt=prompt, session_id=sid, sdk_mode=sdk_mode, cwd=cwd,
+                model=model, effort=effort, fork=fork,
+                chat_id=chat_id, thread_id=thread_id, ask=ask, timeout_s=TIMEOUT,
+            )
+    else:
+        def update_status(label: str) -> None:
+            if status_msg_id is not None:
+                edit_status(chat_id, status_msg_id, label)
 
-    with TypingPinger(chat_id, thread_id=thread_id):
-        reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort, fork=fork)
+        with TypingPinger(chat_id, thread_id=thread_id):
+            reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort, fork=fork)
     chat_state["session_id"] = new_sid
     chat_state["owned"] = True  # da qui in poi la sessione (o il suo fork) è locale
     chat_state.setdefault("cwd", cwd)
@@ -1886,9 +1970,11 @@ def handle(msg: dict, state: dict) -> None:
                 t["session_id"] = new_sid
                 break
     save_state(state)
-    if status_msg_id is not None:
-        delete_message(chat_id, status_msg_id)
-    send(chat_id, reply or "(vuoto)", thread_id=thread_id)
+    # Nel path SDK cc_live ha già inviato la reply finale e rimosso il live msg.
+    if not use_sdk:
+        if status_msg_id is not None:
+            delete_message(chat_id, status_msg_id)
+        send(chat_id, reply or "(vuoto)", thread_id=thread_id)
 
 
 def handle_callback(cb: dict, state: dict) -> None:
@@ -1944,6 +2030,27 @@ def handle_callback(cb: dict, state: dict) -> None:
                 build_model_keyboard(new_cur),
             )
         answer_callback(cb_id, f"model → {new_cur or 'default'}")
+        return
+
+    if data.startswith("perm:"):
+        try:
+            _, token, decision = data.split(":", 2)
+        except ValueError:
+            answer_callback(cb_id, "callback malformato", show_alert=True)
+            return
+        allowed = decision == "allow"
+        if HAVE_SDK and cc_live.resolve_permission(token, allowed):
+            answer_callback(cb_id, "✅ permesso" if allowed else "⛔ negato")
+        else:
+            answer_callback(cb_id, "richiesta scaduta", show_alert=True)
+        return
+
+    if data.startswith("stop:"):
+        token = data.split(":", 1)[1]
+        if HAVE_SDK and cc_live.request_stop(token):
+            answer_callback(cb_id, "⏹ interrompo…")
+        else:
+            answer_callback(cb_id, "turno non più attivo", show_alert=True)
         return
 
     answer_callback(cb_id, "callback non riconosciuto")
