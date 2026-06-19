@@ -13,6 +13,7 @@ forma di ritorno dell'attuale `run_claude_streaming`.
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from typing import Any, Callable
@@ -33,6 +34,24 @@ from claude_agent_sdk import (
     UserMessage,
     query,
 )
+
+def _thinking_config() -> "dict | None":
+    """Config extended-thinking per ClaudeAgentOptions (env `CC_THINKING`).
+
+    IMPORTANTE: opus 4.7+ di default OMETTE il testo del thinking (solo
+    signature) → niente `thinking_delta` in streaming → niente bolla "🧠" in
+    corsivo. Per riceverlo serve `display: "summarized"`.
+
+    Valori `CC_THINKING`: "adaptive"/"on" (default) → adaptive + summarized;
+    un intero → budget fisso + summarized; "off"/"disabled" → niente thinking.
+    """
+    val = (os.environ.get("CC_THINKING", "adaptive") or "").strip().lower()
+    if val in ("", "off", "0", "no", "false", "disabled", "none"):
+        return None
+    if val.isdigit():
+        return {"type": "enabled", "budget_tokens": int(val), "display": "summarized"}
+    return {"type": "adaptive", "display": "summarized"}
+
 
 # Tool senza effetti sul filesystem: in ask-mode auto-allow (niente bottoni).
 READONLY_TOOLS = {
@@ -160,6 +179,7 @@ async def _drive(
         model=model or None,
         effort=effort or None,                        # type: ignore[arg-type]
         include_partial_messages=True,                # delta streaming testo/thinking
+        thinking=_thinking_config(),                  # display summarized → thinking_delta visibili
         hooks=hooks,
     )
 
