@@ -128,6 +128,26 @@ _active_skeys: set = set()
 _active_lock = threading.Lock()
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=20, thread_name_prefix="cc-worker")
 
+# /goal: modalità obiettivo autonomo. Claude lavora a turni finché un checker
+# indipendente (modello veloce che esegue comandi reali) verifica la condizione.
+GOAL_MAX_TURNS = int(os.environ.get("CC_GOAL_MAX_TURNS", "10") or 10)
+GOAL_CHECKER_MODEL = (os.environ.get("CC_GOAL_CHECKER_MODEL", "claude-haiku-4-5") or "claude-haiku-4-5").strip()
+_goal_stop_skeys: set = set()
+_goal_stop_lock = threading.Lock()
+
+
+def _goal_request_stop(skey: str) -> None:
+    with _goal_stop_lock:
+        _goal_stop_skeys.add(skey)
+
+
+def _goal_stop_requested(skey: str, *, clear: bool = False) -> bool:
+    with _goal_stop_lock:
+        hit = skey in _goal_stop_skeys
+        if hit and clear:
+            _goal_stop_skeys.discard(skey)
+        return hit
+
 
 def acquire_singleton_lock() -> None:
     """Garantisce una sola istanza del bot via flock esclusivo non-bloccante.
@@ -158,6 +178,7 @@ BOT_COMMANDS = [
     {"command": "mode", "description": "Permission mode (default bypassPermissions)"},
     {"command": "ask", "description": "Toggle approvazione tool interattiva (SDK)"},
     {"command": "effort", "description": "Effort level (low|medium|high|xhigh|max)"},
+    {"command": "goal", "description": "Obiettivo autonomo: lavora finché un checker verifica la condizione"},
     {"command": "cwd", "description": "Mostra/cambia working directory"},
     {"command": "model", "description": "Mostra/cambia model id"},
     {"command": "caveman", "description": "Toggle stile caveman (on|off)"},
@@ -1379,6 +1400,118 @@ def run_claude(prompt: str, session_id: str | None, mode: str, cwd: str, model: 
     return run_claude_streaming(prompt, session_id, mode, cwd, model, on_status=None)
 
 
+def run_goal_checker(condition: str, cwd: str) -> tuple[bool, str]:
+    """Verificatore indipendente del /goal: una sessione Claude separata (modello
+    veloce) che ESEGUE comandi reali e legge i file nella cwd per stabilire se la
+    condizione di completamento è già soddisfatta. Ritorna (done, motivo)."""
+    prompt = (
+        "Sei un VERIFICATORE indipendente e severo, non l'esecutore. Stabilisci se la "
+        "CONDIZIONE di completamento qui sotto è GIÀ pienamente soddisfatta ADESSO. "
+        "Esegui i comandi necessari (Bash) e leggi i file (Read) nella working "
+        "directory per controllare lo stato reale: non fidarti di descrizioni o "
+        "assunzioni, non modificare nulla.\n\n"
+        f"CONDIZIONE:\n{condition}\n\n"
+        "Dopo aver verificato, termina con UNA SOLA riga finale, esattamente in uno "
+        "di questi due formati:\n"
+        "DONE\n"
+        "CONTINUE: <cosa manca ancora, in una frase>"
+    )
+    text, _sid, _meta = run_claude_streaming(
+        prompt, None, "bypassPermissions", cwd, GOAL_CHECKER_MODEL, effort="low",
+    )
+    for line in reversed((text or "").splitlines()):
+        s = line.strip().strip("*`_ ").strip()
+        up = s.upper()
+        if up == "DONE" or up.startswith("DONE "):
+            return True, ""
+        if up.startswith("CONTINUE"):
+            reason = s.split(":", 1)[1].strip() if ":" in s else ""
+            return False, (reason or "(motivo non specificato)")
+    # nessun verdetto esplicito: euristica prudente -> considera NON completo
+    up = (text or "").upper()
+    if "DONE" in up and "CONTINUE" not in up:
+        return True, ""
+    return False, ((text or "").strip()[:200] or "(checker senza verdetto)")
+
+
+def run_goal_loop(chat_id: int, thread_id: "int | None", skey: str, condition: str, state: dict) -> None:
+    """Loop /goal: alterna un turno di Claude e un controllo del checker indipendente
+    finché la condizione è soddisfatta, lo stop è richiesto (bottone ⏹) o si
+    esauriscono i turni. Gira dentro il worker della skey, quindi la sessione resta
+    'occupata' per tutta la durata; lo stop arriva via callback (fuori dal lock)."""
+    chat_state = state.setdefault(skey, {})
+    cwd = chat_state.get("cwd", CWD)
+    mode = chat_state.get("mode", DEFAULT_MODE)
+    model = chat_state.get("model", MODEL) or None
+    effort = chat_state.get("effort", DEFAULT_EFFORT) or None
+    _goal_stop_requested(skey, clear=True)  # azzera eventuale flag residuo
+
+    send_with_keyboard(
+        chat_id,
+        f"🎯 Goal avviato (max {GOAL_MAX_TURNS} turni)\n"
+        f"Condizione: {condition}\n"
+        "Dopo ogni turno un verificatore indipendente controlla eseguendo comandi reali. "
+        "Premi ⏹ per fermare.",
+        [[{"text": "⏹ Ferma goal", "callback_data": f"goalstop:{skey}"}]],
+        thread_id=thread_id,
+    )
+
+    feedback = ""
+    completed = False
+    turn = 0
+    while turn < GOAL_MAX_TURNS:
+        if _goal_stop_requested(skey, clear=True):
+            send(chat_id, "⏹ Goal interrotto.", thread_id=thread_id)
+            return
+        turn += 1
+        sid_before = chat_state.get("session_id")
+        if turn == 1:
+            prompt = (
+                "[Goal mode]\n"
+                "Lavori in modalità obiettivo autonomo: l'obiettivo è raggiungere la "
+                "condizione di completamento qui sotto. Agisci ORA con azioni concrete, "
+                "non chiedere conferme e non limitarti a descrivere il piano.\n\n"
+                f"CONDIZIONE DI COMPLETAMENTO:\n{condition}\n\n"
+                "Esegui il primo blocco di lavoro verso questa condizione."
+            )
+        else:
+            prompt = (
+                "[Goal mode — prosecuzione]\n"
+                "Un verificatore indipendente ha controllato: la condizione NON è ancora "
+                f"soddisfatta. Cosa manca: {feedback}\n\n"
+                f"CONDIZIONE DI COMPLETAMENTO:\n{condition}\n\n"
+                "Continua il lavoro per soddisfarla. Agisci, non descrivere soltanto."
+            )
+        with TypingPinger(chat_id, thread_id=thread_id):
+            reply, new_sid, meta = run_claude_streaming(prompt, sid_before, mode, cwd, model, effort=effort)
+        chat_state["session_id"] = new_sid
+        accumulate_usage(chat_state, meta)
+        if new_sid and new_sid != sid_before:
+            manifest_add(cwd, new_sid)
+        save_state(state)
+        send(chat_id, f"**🎯 turno {turn}/{GOAL_MAX_TURNS}**\n\n{reply or '(vuoto)'}", thread_id=thread_id)
+
+        if _goal_stop_requested(skey, clear=True):
+            send(chat_id, "⏹ Goal interrotto.", thread_id=thread_id)
+            return
+
+        with TypingPinger(chat_id, thread_id=thread_id):
+            done, feedback = run_goal_checker(condition, cwd)
+        if done:
+            completed = True
+            send(chat_id, f"✅ **Goal raggiunto** in {turn} turni — verificato dal checker indipendente.", thread_id=thread_id)
+            break
+        send(chat_id, f"🔁 Non ancora. Manca: {feedback}", thread_id=thread_id)
+
+    if not completed:
+        send(
+            chat_id,
+            f"⏹ Limite di {GOAL_MAX_TURNS} turni raggiunto senza soddisfare la condizione. "
+            "Rilancia /goal con la stessa condizione per proseguire.",
+            thread_id=thread_id,
+        )
+
+
 def accumulate_usage(chat_state: dict, meta: dict) -> None:
     agg = chat_state.setdefault("usage_agg", {
         "input_tokens": 0,
@@ -1677,6 +1810,7 @@ def handle(msg: dict, state: dict) -> None:
             "/mode [plan|acceptEdits|bypassPermissions] — permission mode\n"
             "/ask [on|off] — approvazione tool interattiva (SDK): Write/Edit/Bash chiedono conferma\n"
             "/effort [low|medium|high|xhigh|max|reset] — effort level\n"
+            "/goal &lt;condizione&gt; — obiettivo autonomo: lavora finché un checker indipendente verifica la condizione (max turni, stop col bottone)\n"
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
             "/caveman [on|off] — toggle stile caveman (default off)\n"
@@ -2017,6 +2151,30 @@ def handle(msg: dict, state: dict) -> None:
                     chat_state["session_id"] = t["session_id"]
                     chat_state.setdefault("owned", False)
                 break
+    if text.startswith("/goal"):
+        arg = text[len("/goal"):].strip()
+        if not arg:
+            send(
+                chat_id,
+                "🎯 **/goal** — modalità obiettivo autonomo.\n"
+                "Uso: /goal <condizione di completamento verificabile>\n"
+                f"Claude lavora da solo (max {GOAL_MAX_TURNS} turni) finché un verificatore "
+                "indipendente conferma — eseguendo comandi reali — che la condizione è "
+                "soddisfatta. Fermalo col bottone ⏹.\n"
+                "Esempi:\n"
+                "• /goal i test passano: `pytest -q` esce con codice 0\n"
+                "• /goal il file report.md esiste e contiene la sezione Conclusioni\n"
+                "/goal stop — ferma il goal in corso",
+                thread_id=thread_id,
+            )
+            return
+        if arg.lower() in ("stop", "clear", "off", "annulla"):
+            _goal_request_stop(skey)
+            send(chat_id, "🎯 Stop richiesto: il goal si ferma al prossimo controllo (se è in un turno lungo usa il bottone ⏹).", thread_id=thread_id)
+            return
+        run_goal_loop(chat_id, thread_id, skey, arg, state)
+        return
+
     sid = chat_state.get("session_id")
     cwd = chat_state.get("cwd", CWD)
     mode = chat_state.get("mode", DEFAULT_MODE)
@@ -2174,6 +2332,12 @@ def handle_callback(cb: dict, state: dict) -> None:
     skey = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
     data = cb.get("data") or ""
     cs = state.setdefault(skey, {})
+
+    if data.startswith("goalstop:"):
+        target_skey = data.split(":", 1)[1]
+        _goal_request_stop(target_skey)
+        answer_callback(cb_id, "⏹ stop richiesto")
+        return
 
     if data.startswith("effort:"):
         val = data.split(":", 1)[1]
