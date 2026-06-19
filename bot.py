@@ -101,6 +101,7 @@ SYNC_EXCLUDE = [
 MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "40"))
 # colori icona topic ammessi da Telegram (createForumTopic icon_color)
 TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
+TOPIC_NAME_MAXLEN = 23  # nomi corti: leggibili nella lista topic di Telegram
 
 # Coda publish: file json depositati da `claude-publish` (Mac, via SSH).
 PUBLISH_DIR = Path(os.path.expanduser(os.environ.get("PUBLISH_DIR", "~/.cc-telegram-bot.publish")))
@@ -1494,15 +1495,23 @@ def translate_text(text: str, target_lang: str) -> str | None:
         return None
 
 
+def _clip_topic_name(name: str, n: int = TOPIC_NAME_MAXLEN) -> str:
+    """Tronca a n caratteri senza tagliare a metà parola, se possibile."""
+    name = " ".join((name or "").split())
+    if len(name) <= n:
+        return name
+    cut = name[:n]
+    if " " in cut and len(cut.rsplit(" ", 1)[0]) >= n // 2:
+        cut = cut.rsplit(" ", 1)[0]
+    return cut.rstrip(" -–—:,.").strip()
+
+
 def _heuristic_topic_name(text: str) -> str:
     """Fallback senza LLM: prime parole del messaggio, ripulite."""
     t = " ".join((text or "").split())          # collassa whitespace/newline
     t = _re.sub(r"^/\w+\s*", "", t)              # rimuovi eventuale comando iniziale
     t = _re.sub(r"^[\[(].*?[\])]\s*", "", t)     # rimuovi un eventuale [tag] iniziale
-    name = " ".join(t.split(" ")[:6]).strip()
-    if len(name) > 42:
-        name = name[:42].rsplit(" ", 1)[0].strip()
-    return name or "chat"
+    return _clip_topic_name(t) or "chat"
 
 
 def _smart_topic_name_llm(text: str) -> str | None:
@@ -1515,10 +1524,10 @@ def _smart_topic_name_llm(text: str) -> str | None:
             "messages": [
                 {"role": "system", "content": (
                     "Sei un generatore di titoli per thread di chat. Dato il primo "
-                    "messaggio dell'utente, rispondi SOLO con un titolo brevissimo "
-                    "(massimo 5 parole, nessuna virgoletta, nessun punto finale, "
-                    "nessuna emoji, nella stessa lingua del messaggio) che ne riassuma "
-                    "l'argomento."
+                    "messaggio dell'utente, rispondi SOLO con un titolo cortissimo: "
+                    "MASSIMO 23 caratteri (circa 2-3 parole), nessuna virgoletta, "
+                    "nessun punto finale, nessuna emoji, stessa lingua del messaggio. "
+                    "Sintetizza l'argomento, non ripetere il messaggio."
                 )},
                 {"role": "user", "content": text[:2000]},
             ],
@@ -1551,7 +1560,8 @@ def smart_topic_name(text: str) -> str | None:
     if not text:
         return None
     name = _smart_topic_name_llm(text) or _heuristic_topic_name(text)
-    return (name or "")[:60].strip() or None
+    name = _clip_topic_name(name)
+    return name or None
 
 
 def _do_auto_rename(chat_id: int, thread_id: int, text: str) -> None:
