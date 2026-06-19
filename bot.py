@@ -161,6 +161,7 @@ BOT_COMMANDS = [
     {"command": "model", "description": "Mostra/cambia model id"},
     {"command": "caveman", "description": "Toggle stile caveman (on|off)"},
     {"command": "handoff", "description": "Handoff → nuova sessione in nuovo topic"},
+    {"command": "rename", "description": "Rinomina il thread corrente (topic)"},
     {"command": "sync", "description": "Crea/aggiorna i thread delle sessioni CC (forum)"},
     {"command": "threads", "description": "Lista thread sessione mappati (forum)"},
 ]
@@ -1493,6 +1494,73 @@ def translate_text(text: str, target_lang: str) -> str | None:
         return None
 
 
+def _heuristic_topic_name(text: str) -> str:
+    """Fallback senza LLM: prime parole del messaggio, ripulite."""
+    t = " ".join((text or "").split())          # collassa whitespace/newline
+    t = _re.sub(r"^/\w+\s*", "", t)              # rimuovi eventuale comando iniziale
+    t = _re.sub(r"^[\[(].*?[\])]\s*", "", t)     # rimuovi un eventuale [tag] iniziale
+    name = " ".join(t.split(" ")[:6]).strip()
+    if len(name) > 42:
+        name = name[:42].rsplit(" ", 1)[0].strip()
+    return name or "chat"
+
+
+def _smart_topic_name_llm(text: str) -> str | None:
+    """Titolo brevissimo via gpt-4o-mini (stesso canale di translate_text)."""
+    if not OPENAI_API_KEY or not text:
+        return None
+    try:
+        body = json.dumps({
+            "model": "gpt-4o-mini",
+            "messages": [
+                {"role": "system", "content": (
+                    "Sei un generatore di titoli per thread di chat. Dato il primo "
+                    "messaggio dell'utente, rispondi SOLO con un titolo brevissimo "
+                    "(massimo 5 parole, nessuna virgoletta, nessun punto finale, "
+                    "nessuna emoji, nella stessa lingua del messaggio) che ne riassuma "
+                    "l'argomento."
+                )},
+                {"role": "user", "content": text[:2000]},
+            ],
+            "max_tokens": 24,
+            "temperature": 0.3,
+        }).encode()
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Authorization": f"Bearer {OPENAI_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=15) as r:
+            payload = json.loads(r.read().decode())
+        result = ((payload.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+        result = result.strip().strip('"').strip("'").rstrip(".").strip()
+        return result or None
+    except Exception as e:
+        log(f"smart_topic_name err: {e}")
+        return None
+
+
+def smart_topic_name(text: str) -> str | None:
+    """Nome leggibile per un topic a partire dal primo messaggio.
+    Prova l'LLM (gpt-4o-mini) e ripiega sull'euristica. Max 60 char."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    name = _smart_topic_name_llm(text) or _heuristic_topic_name(text)
+    return (name or "")[:60].strip() or None
+
+
+def _do_auto_rename(chat_id: int, thread_id: int, text: str) -> None:
+    """Rinomina (in background) un topic 'vergine' col titolo dedotto dal primo messaggio."""
+    title = smart_topic_name(text)
+    if title and edit_forum_topic(chat_id, thread_id, title):
+        log(f"auto-rename topic {thread_id} → {title!r}")
+
+
 def extract_media_paths(msg: dict) -> tuple[list[str], str]:
     """Scarica eventuali photo/document/audio/voice. Ritorna (paths, caption)."""
     paths: list[str] = []
@@ -1603,6 +1671,7 @@ def handle(msg: dict, state: dict) -> None:
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
             "/caveman [on|off] — toggle stile caveman (default off)\n"
             "/handoff [nome] — handoff sessione → nuova sessione (nuovo topic)\n"
+            "/rename &lt;nome&gt; — rinomina il thread corrente (i nuovi topic prendono un nome auto)\n"
             "/sync — crea/aggiorna i thread delle sessioni CC\n"
             "/threads — lista thread mappati\n"
             "/help — questo messaggio\n\n"
@@ -1904,6 +1973,28 @@ def handle(msg: dict, state: dict) -> None:
         save_state(state)
         send(chat_id, f"📂 cwd → {new_cwd} (sessione resettata)", thread_id=thread_id)
         return
+    if text.startswith("/rename"):
+        if thread_id is None:
+            send(chat_id, "ℹ️ /rename funziona solo dentro un thread (topic): qui non c'è un topic da rinominare.", thread_id=thread_id)
+            return
+        new_name = text.split(maxsplit=1)[1].strip() if len(text.split(maxsplit=1)) > 1 else ""
+        if not new_name:
+            send(chat_id, "uso: <code>/rename &lt;nuovo nome&gt;</code>", thread_id=thread_id)
+            return
+        new_name = new_name[:60]
+        if edit_forum_topic(chat_id, thread_id, new_name):
+            cs = state.setdefault(skey, {})
+            cs["auto_named"] = True  # evita che l'auto-naming sovrascriva il nome scelto
+            reg = forum_reg(state, chat_id)
+            for t in (reg.get("topics") or {}).values():
+                if t.get("thread_id") == thread_id:
+                    t["name"] = new_name
+                    break
+            save_state(state)
+            send(chat_id, f"✏️ thread rinominato → «{new_name}»", thread_id=thread_id)
+        else:
+            send(chat_id, "❌ rename fallito. Serve un topic forum (in chat privata: abilita i Topics via BotFather; in gruppo: bot admin con 'Manage Topics').", thread_id=thread_id)
+        return
 
     chat_state = state.setdefault(skey, {})
     # Topic forum senza stato runtime ancora seeded: prova a bindare dal mapping.
@@ -1944,6 +2035,16 @@ def handle(msg: dict, state: dict) -> None:
     if not text:
         text = caption or "Analizza il file allegato."
         log(f"media: {len(media_paths)} file, caption={caption!r}")
+
+    # Auto-naming: al primo messaggio di un topic "vergine" (creato a mano dall'utente,
+    # non mappato dal bot e senza sessione ancora) deduci un titolo dal messaggio e
+    # rinomina il topic. In background: non blocca il turno. Una volta sola (auto_named).
+    if thread_id is not None and not sid and not chat_state.get("auto_named"):
+        reg = forum_reg(state, chat_id)
+        is_bot_topic = any(t.get("thread_id") == thread_id for t in (reg.get("topics") or {}).values())
+        if not is_bot_topic:
+            chat_state["auto_named"] = True  # ottimistico: evita doppioni a turni successivi
+            _executor.submit(_do_auto_rename, chat_id, thread_id, text)
 
     # Reply-to: includi messaggio citato come contesto
     reply_to = msg.get("reply_to_message") or {}
