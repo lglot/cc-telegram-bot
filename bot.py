@@ -186,6 +186,7 @@ BOT_COMMANDS = [
     {"command": "rename", "description": "Rinomina il thread corrente (topic)"},
     {"command": "sync", "description": "Crea/aggiorna i thread delle sessioni CC (forum)"},
     {"command": "threads", "description": "Lista thread sessione mappati (forum)"},
+    {"command": "reprovision", "description": "Reinstalla (idempotente) le app dev sulla LG TV"},
 ]
 
 
@@ -1814,6 +1815,7 @@ def handle(msg: dict, state: dict) -> None:
             "/cwd [path] — working dir\n"
             "/model [id|reset] — model id (es. claude-opus-4-7)\n"
             "/caveman [on|off] — toggle stile caveman (default off)\n"
+            "/reprovision — reinstalla (idempotente) le app dev sulla LG TV\n"
             "/handoff [nome] — handoff sessione → nuova sessione (nuovo topic)\n"
             "/rename &lt;nome&gt; — rinomina il thread corrente (i nuovi topic prendono un nome auto)\n"
             "/sync — crea/aggiorna i thread delle sessioni CC\n"
@@ -2042,6 +2044,23 @@ def handle(msg: dict, state: dict) -> None:
             send(chat_id, "🪨 caveman ON. pochi token. brain still big.", thread_id=thread_id)
         else:
             send(chat_id, "🗣 caveman OFF — risposte in italiano normale.", thread_id=thread_id)
+        return
+    if text.startswith("/reprovision"):
+        # Reinstalla (idempotente) le app dev sulla LG TV: wrapper su lgcloud
+        # -> tailscale ssh lgserver -> ssh TV -> luna dev/install. Vedi wiki webosbrew-apps.
+        send(chat_id, "📺 Reprovision LG TV in corso…", thread_id=thread_id)
+        try:
+            r = subprocess.run(
+                ["bash", os.path.expanduser("~/reprovision-tv.sh")],
+                capture_output=True, text=True, timeout=240,
+            )
+            out = (r.stdout + r.stderr).strip() or "(nessun output)"
+            head = "✅" if r.returncode == 0 else "⚠️"
+            send(chat_id, f"{head} <pre>{_html.escape(out[-3500:])}</pre>", thread_id=thread_id)
+        except subprocess.TimeoutExpired:
+            send(chat_id, "⏱ Timeout (240s) sul reprovision TV.", thread_id=thread_id)
+        except Exception as e:  # noqa: BLE001
+            send(chat_id, f"❌ Errore reprovision: {_html.escape(str(e))}", thread_id=thread_id)
         return
     if text.startswith("/mode"):
         parts = text.split(maxsplit=1)
