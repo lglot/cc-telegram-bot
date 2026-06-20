@@ -259,12 +259,47 @@ import html as _html
 import re as _re
 
 
+_TABLE_SEP_RE = _re.compile(r"^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-+:?\s*)*\|?\s*$")
+
+
+def _md_tables_to_pre(text: str, stash) -> str:
+    """Rileva tabelle markdown (riga header + separatore ---|--- + righe dati) e le
+    rende come <pre> monospazio allineato (Telegram non ha tabelle native). Stashate
+    così non vengono ri-processate. Non-tabelle restano invariate."""
+    lines = text.split("\n")
+    out: list[str] = []
+    i = 0
+    while i < len(lines):
+        if "|" in lines[i] and i + 1 < len(lines) and _TABLE_SEP_RE.match(lines[i + 1]):
+            block = [lines[i]]
+            j = i + 2
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                block.append(lines[j])
+                j += 1
+            rows = [[c.strip() for c in r.strip().strip("|").split("|")] for r in block]
+            ncol = max(len(r) for r in rows)
+            rows = [r + [""] * (ncol - len(r)) for r in rows]
+            w = [max(len(r[k]) for r in rows) for k in range(ncol)]
+            rendered: list[str] = []
+            for ri, r in enumerate(rows):
+                rendered.append("  ".join(r[k].ljust(w[k]) for k in range(ncol)).rstrip())
+                if ri == 0:  # riga di separazione sotto l'header
+                    rendered.append("  ".join("-" * w[k] for k in range(ncol)))
+            out.append(stash("<pre>" + _html.escape("\n".join(rendered)) + "</pre>"))
+            i = j
+        else:
+            out.append(lines[i])
+            i += 1
+    return "\n".join(out)
+
+
 def md_to_tg_html(text: str) -> str:
     """Converte markdown CC in HTML compatibile Telegram.
 
     Telegram HTML supporta: <b> <i> <u> <s> <code> <pre> <a> <blockquote>.
-    Strategia: estrae prima i blocchi code (per non escapare il loro contenuto come
-    se fosse markdown), escapa il resto, poi reinserisce i blocchi escapati.
+    Strategia: estrae prima i blocchi non-markdown (code, tabelle) come placeholder
+    (così il contenuto non viene ri-processato), escapa il resto, applica gli stili
+    inline, poi reinserisce i placeholder.
     """
     if not text:
         return ""
@@ -284,6 +319,9 @@ def md_to_tg_html(text: str) -> str:
         return stash(f"<pre>{_html.escape(body)}</pre>")
 
     text = _re.sub(r"```([a-zA-Z0-9_-]*)\n?(.*?)```", repl_pre, text, flags=_re.DOTALL)
+
+    # tabelle markdown → <pre> allineato (prima dell'escape, stashate)
+    text = _md_tables_to_pre(text, stash)
 
     # inline code `...`
     def repl_code(m: _re.Match) -> str:
@@ -307,16 +345,25 @@ def md_to_tg_html(text: str) -> str:
         return stash(f'<a href="{url}">{url}</a>')
     text = _re.sub(r"(https?://[^\s<>\"']+)", repl_url, text)
 
+    # bold+italic ***x*** (prima di ** e *)
+    text = _re.sub(r"\*\*\*([^*\n]+)\*\*\*", r"<b><i>\1</i></b>", text)
     # bold **x** o __x__
     text = _re.sub(r"\*\*([^*\n]+)\*\*", r"<b>\1</b>", text)
     text = _re.sub(r"__([^_\n]+)__", r"<b>\1</b>", text)
     # italic *x* o _x_ (solo se non confonde con **)
     text = _re.sub(r"(?<![*\w])\*([^*\n]+)\*(?!\w)", r"<i>\1</i>", text)
     text = _re.sub(r"(?<![_\w])_([^_\n]+)_(?!\w)", r"<i>\1</i>", text)
+    # strikethrough ~~x~~
+    text = _re.sub(r"~~([^~\n]+)~~", r"<s>\1</s>", text)
     # headers ### Foo → <b>Foo</b>
     text = _re.sub(r"^#{1,6}\s+(.+)$", r"<b>\1</b>", text, flags=_re.MULTILINE)
     # bullets "- " o "* " inizio riga → "• "
     text = _re.sub(r"^(\s*)[-*]\s+", r"\1• ", text, flags=_re.MULTILINE)
+    # blockquote: run di righe "&gt; ..." (il > è già escapato) → <blockquote>
+    def repl_quote(m: _re.Match) -> str:
+        body = _re.sub(r"(?m)^&gt;[ ]?", "", m.group(0))
+        return f"<blockquote>{body}</blockquote>"
+    text = _re.sub(r"(?m)^&gt;[ ]?.*(?:\n&gt;[ ]?.*)*", repl_quote, text)
     # rule horizontal --- → linea
     text = _re.sub(r"^---+$", "─" * 20, text, flags=_re.MULTILINE)
 
@@ -2055,8 +2102,9 @@ def handle(msg: dict, state: dict) -> None:
                 capture_output=True, text=True, timeout=240,
             )
             out = (r.stdout + r.stderr).strip() or "(nessun output)"
-            head = "✅" if r.returncode == 0 else "⚠️"
-            send(chat_id, f"{head} <pre>{_html.escape(out[-3500:])}</pre>", thread_id=thread_id)
+            head = "✅ Reprovision TV" if r.returncode == 0 else "⚠️ Reprovision TV (con errori)"
+            # code fence: md_to_tg_html lo rende come <pre> con escaping corretto
+            send(chat_id, f"{head}\n```\n{out[-3500:]}\n```", thread_id=thread_id)
         except subprocess.TimeoutExpired:
             send(chat_id, "⏱ Timeout (240s) sul reprovision TV.", thread_id=thread_id)
         except Exception as e:  # noqa: BLE001
