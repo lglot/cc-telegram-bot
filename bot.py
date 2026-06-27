@@ -103,10 +103,8 @@ MAX_TOPICS = int(os.environ.get("MAX_TOPICS", "40"))
 TOPIC_COLORS = [7322096, 16766590, 13338331, 9367192, 16749490, 16478047]
 TOPIC_NAME_MAXLEN = 23  # nomi corti: leggibili nella lista topic di Telegram
 
-# Coda publish: file json depositati da `claude-publish` (Mac, via SSH).
+# Coda publish: file json depositati da `claude-handoff-publish` (Mac, via SSH).
 PUBLISH_DIR = Path(os.path.expanduser(os.environ.get("PUBLISH_DIR", "~/.cc-telegram-bot.publish")))
-# Manifest Syncthing (sintassi .stignore): sessioni da sincronizzare Mac<->lgcloud.
-MANIFEST = PROJECTS_DIR / "shared-includes"
 # Path remap: il bot deve lanciare claude con cwd canonico (/Users/...) anche su
 # lgcloud (/home/luigi), così l'encoded dir ~/.claude/projects/<enc> combacia col Mac
 # e le sessioni sono portabili. Su lgcloud: CC_REMAP_FROM=/home/luigi CC_REMAP_TO=/Users/luigilotito
@@ -864,66 +862,6 @@ def _enc_cwd(cwd: str) -> str:
     return _re.sub(r"[/.]", "-", cwd)
 
 
-MANIFEST_HEADER = "// sessioni pubblicate (gestito da claude-publish / bot). NON editare a mano: manifest-rebuild."
-
-
-def manifest_add(cwd: str, sid: str) -> bool:
-    """Aggiunge una sessione al manifest Syncthing e lo riscrive in forma canonica.
-
-    Forma canonica first-match-wins (.stignore):
-        !/<enc>/<uuid>.jsonl    file sessione
-        !/<enc>/<uuid>          subdir sessione (subagents/, tool-results/)
-        /<enc>/**               ignora il RESTO del contenuto della dir
-        !/<enc>                 re-include la sola dir (traversal)
-    NB: un pattern dir nudo "!/<enc>" includerebbe ricorsivamente l'intera
-    directory (bug: trascinava l'intera dir wiki, 246MB). Ordine obbligato:
-    per questo niente append, sempre rebuild completo.
-    Ritorna True se la sessione non era già nel manifest.
-    """
-    if not cwd or not sid:
-        return False
-    enc = _enc_cwd(normalize_cwd(cwd))
-    pairs: set[tuple[str, str]] = set()
-    prev = ""
-    try:
-        if MANIFEST.exists():
-            prev = MANIFEST.read_text()
-            for ln in prev.splitlines():
-                m = _re.match(r"^!/([^/]+)/([0-9a-fA-F-]+)\.jsonl\s*$", ln.strip())
-                if m:
-                    pairs.add((m.group(1), m.group(2)))
-    except Exception:
-        pass
-    added = (enc, sid) not in pairs
-    pairs.add((enc, sid))
-    dirs = sorted({e for e, _ in pairs})
-    lines = [MANIFEST_HEADER]
-    for e, u in sorted(pairs):
-        lines.append(f"!/{e}/{u}.jsonl")
-        lines.append(f"!/{e}/{u}")
-    for e in dirs:
-        lines.append(f"/{e}/**")
-    for e in dirs:
-        lines.append(f"!/{e}")
-    try:
-        MANIFEST.parent.mkdir(parents=True, exist_ok=True)
-        MANIFEST.write_text("\n".join(lines) + "\n")
-        if added:
-            log(f"manifest += {enc}/{sid[:8]}")
-    except Exception as e:
-        log(f"manifest_add err: {e}")
-        return False
-    return added
-
-
-def session_file_exists(cwd: str, sid: str) -> bool:
-    """True se il file sessione esiste localmente (post-sync Syncthing)."""
-    if not cwd or not sid:
-        return False
-    enc = _enc_cwd(normalize_cwd(cwd))
-    return (PROJECTS_DIR / enc / f"{sid}.jsonl").exists()
-
-
 def edit_forum_topic(chat_id: int, thread_id: int, name: str) -> bool:
     try:
         r = tg("editForumTopic", chat_id=chat_id, message_thread_id=thread_id, name=name[:128])
@@ -1006,7 +944,6 @@ def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
     skey = f"{forum_id}:{tid}"
     cs = state.setdefault(skey, {})
     cs["cwd"] = cwd
-    cs["owned"] = True  # sessione nata su lgcloud (no fork)
     mode = cs.get("mode", DEFAULT_MODE)
     model = cs.get("model", MODEL) or None
     eff = cs.get("effort", DEFAULT_EFFORT) or None
@@ -1042,18 +979,16 @@ def _process_handoff_seed(req: dict, forum_id: int, state: dict) -> None:
         delete_message(forum_id, status_id)
     if new_sid:
         cs["session_id"] = new_sid
-        manifest_add(cwd, new_sid)
     accumulate_usage(cs, meta)
     save_state(state)
     send(forum_id, reply or "(nessuna risposta)", thread_id=tid)
 
 
 def process_publish_queue(state: dict) -> None:
-    """Scansiona PUBLISH_DIR: per ogni richiesta crea+binda un topic.
+    """Scansiona PUBLISH_DIR: per ogni richiesta handoff-seed crea+binda un topic.
 
-    Richiesta json depositata da `claude-publish` (Mac via SSH): {uuid, cwd, name}.
-    I topic vengono creati nella chat privata col bot (topics privati, Bot API
-    9.4) o nel forum registrato. Idempotente per dir_key.
+    Richiesta json depositata da `claude-handoff-publish` (Mac via SSH), variant
+    "handoff-seed": avvia una sessione NUOVA su lgcloud seedata dall'handoff.
     """
     if not PUBLISH_DIR.is_dir():
         return
@@ -1067,72 +1002,18 @@ def process_publish_queue(state: dict) -> None:
         except Exception:
             os.remove(rp)
             continue
-        if req.get("variant") == "handoff-seed":
-            if forum_id is None:
-                return  # nessuna destinazione: lascia in coda, riprova dopo
-            try:
-                _process_handoff_seed(req, forum_id, state)
-            except Exception as e:
-                log(f"handoff-seed err: {e}")
-                for aid in ALLOW:
-                    send(aid, f"❌ handoff-seed '{req.get('name')}' fallita: {e}")
-            os.remove(rp)
-            continue
-        uuid = req.get("uuid")
-        cwd = normalize_cwd(req.get("cwd") or "")
-        name = req.get("name") or nice_name(cwd)
-        recap = (req.get("recap") or "").strip()
-        if not uuid or not cwd:
+        if req.get("variant") != "handoff-seed":
+            log(f"publish: variant ignota {req.get('variant')!r}, scarto {os.path.basename(rp)}")
             os.remove(rp)
             continue
         if forum_id is None:
-            log(f"publish '{name}' senza destinazione (ALLOW vuoto?)")
-            return  # lascia la richiesta in coda, riprova al prossimo giro
-        reg = forum_reg(state, forum_id)
-        topics = reg.setdefault("topics", {})
-        # topic per SESSIONE (chiave = uuid); migra eventuale entry legacy keyed per dir
-        entry = topics.get(uuid)
-        if entry is None:
-            dk = _enc_cwd(cwd)
-            legacy = topics.get(dk)
-            if legacy and legacy.get("session_id") == uuid:
-                entry = topics.pop(dk)
-                topics[uuid] = entry
-        # NB: i messaggi passano da send() che converte markdown -> HTML Telegram:
-        # qui si scrive SOLO markdown (mai tag HTML, verrebbero escapati e mostrati grezzi).
-        intro = (
-            f"🧵 **{name}**\n"
-            f"cwd: `{cwd}`\n"
-            f"sessione: `{uuid[:8]}`\n\n"
-            f"Scrivi qui per riprendere questa sessione (sincronizzata col Mac)."
-        )
-        if entry and entry.get("thread_id"):
-            tid = entry["thread_id"]
-            if name != entry.get("name") and edit_forum_topic(forum_id, tid, f"📂 {name}"):
-                entry["name"] = name
-            entry["session_id"] = uuid
-            entry["cwd"] = cwd
-            rcs = state.setdefault(f"{forum_id}:{tid}", {})
-            rcs["session_id"] = uuid
-            rcs["owned"] = False  # sessione del Mac: primo resume con fork
-            send(forum_id, f"↻ ri-pubblicata: **{name}** (sessione `{uuid[:8]}`).", thread_id=tid)
-        else:
-            color = TOPIC_COLORS[len(topics) % len(TOPIC_COLORS)]
-            tid, err = create_forum_topic(forum_id, f"📂 {name}", icon_color=color)
-            if tid is None:
-                for aid in ALLOW:
-                    send(aid, f"❌ publish '{name}' fallita: {err}\n(topics privati abilitati via BotFather? in un gruppo serve admin con Manage Topics)")
-                os.remove(rp)
-                continue
-            topics[uuid] = {"thread_id": tid, "cwd": cwd, "name": name, "session_id": uuid}
-            cs = state.setdefault(f"{forum_id}:{tid}", {})
-            cs["cwd"] = cwd
-            cs["session_id"] = uuid
-            cs["owned"] = False  # sessione del Mac: primo resume con fork
-            send(forum_id, intro, thread_id=tid)
-        if recap:
-            send(forum_id, f"📋 **Recap sessione**\n\n{recap}", thread_id=tid)
-        save_state(state)
+            return  # nessuna destinazione: lascia in coda, riprova dopo
+        try:
+            _process_handoff_seed(req, forum_id, state)
+        except Exception as e:
+            log(f"handoff-seed err: {e}")
+            for aid in ALLOW:
+                send(aid, f"❌ handoff-seed '{req.get('name')}' fallita: {e}")
         os.remove(rp)
 
 
@@ -1224,8 +1105,7 @@ def do_sync(chat_id: int, state: dict) -> str:
         skey = f"{chat_id}:{tid}"
         cs = state.setdefault(skey, {})
         cs.setdefault("cwd", proj["cwd"])
-        if cs.setdefault("session_id", proj["latest_sid"]) == proj["latest_sid"]:
-            cs.setdefault("owned", False)  # sessione potenzialmente del Mac: fork al primo uso
+        cs.setdefault("session_id", proj["latest_sid"])
         created.append(proj["name"])
         # intro nel nuovo topic
         send(
@@ -1253,7 +1133,7 @@ def fmt_threads(state: dict, chat_id: int) -> str:
     reg = forum_reg(state, chat_id)
     topics = reg.get("topics") or {}
     if not topics:
-        return "Nessun thread mappato. Pubblica una sessione dal Mac con /remote-desktop, o usa /sync."
+        return "Nessun thread mappato. Usa /sync, o passa un handoff dal Mac con /cloud-handoff."
     lines = [f"🧵 {len(topics)} thread:"]
     for dk, t in topics.items():
         sid = (t.get("session_id") or "")[:8]
@@ -1537,8 +1417,6 @@ def run_goal_loop(chat_id: int, thread_id: "int | None", skey: str, condition: s
             reply, new_sid, meta = run_claude_streaming(prompt, sid_before, mode, cwd, model, effort=effort)
         chat_state["session_id"] = new_sid
         accumulate_usage(chat_state, meta)
-        if new_sid and new_sid != sid_before:
-            manifest_add(cwd, new_sid)
         save_state(state)
         send(chat_id, f"**🎯 turno {turn}/{GOAL_MAX_TURNS}**\n\n{reply or '(vuoto)'}", thread_id=thread_id)
 
@@ -1832,7 +1710,7 @@ def handle(msg: dict, state: dict) -> None:
     skey = f"{chat_id}:{thread_id}" if thread_id is not None else str(chat_id)
 
     # Registrazione forum alla prima interazione nel gruppo (NO auto-create di massa:
-    # i thread nascono da /remote-desktop sul Mac o da sessioni avviate qui).
+    # i thread nascono da /cloud-handoff sul Mac o da sessioni avviate qui).
     if is_forum_msg(msg):
         reg = forum_reg(state, chat_id)
         if not reg.get("registered"):
@@ -1841,7 +1719,7 @@ def handle(msg: dict, state: dict) -> None:
             log(f"forum registrato chat_id={chat_id}")
             send(
                 chat_id,
-                "👋 Forum registrato. Pubblica una sessione dal Mac con `/remote-desktop`, "
+                "👋 Forum registrato. Passa un handoff dal Mac con `/cloud-handoff`, "
                 "oppure scrivi qui per avviarne una nuova. (<code>/sync</code> per mappare i progetti già presenti.)",
             )
             return
@@ -1872,7 +1750,7 @@ def handle(msg: dict, state: dict) -> None:
             "/threads — lista thread mappati\n"
             "/help — questo messaggio\n\n"
             "Topics attivi (anche in questa chat privata): ogni thread = una sessione CC separata.\n"
-            "Dal Mac: /remote-desktop in una sessione la pubblica qui come thread.\n"
+            "Dal Mac: /cloud-handoff passa il lavoro qui come thread nuovo.\n"
             "Altro testo = prompt a Claude (continua la sessione del thread corrente).",
             thread_id=thread_id,
         )
@@ -2219,7 +2097,6 @@ def handle(msg: dict, state: dict) -> None:
                 chat_state.setdefault("cwd", t.get("cwd", CWD))
                 if t.get("session_id") and not chat_state.get("session_id"):
                     chat_state["session_id"] = t["session_id"]
-                    chat_state.setdefault("owned", False)
                 break
     if text.startswith("/goal"):
         arg = text[len("/goal"):].strip()
@@ -2251,18 +2128,6 @@ def handle(msg: dict, state: dict) -> None:
     model = chat_state.get("model", MODEL) or None
     effort = chat_state.get("effort", DEFAULT_EFFORT) or None
     summary = chat_state.pop("compact_summary", None)
-
-    # Sessione pubblicata (owned=False) ma file non ancora arrivato via Syncthing:
-    # rispondi chiaro invece di un resume che fallirebbe con error_during_execution.
-    # NON resettare session_id: al prossimo messaggio il file sarà arrivato.
-    # (Per le sessioni locali, owned=True, il file esiste per definizione.)
-    if sid and not chat_state.get("owned", True) and not session_file_exists(cwd, sid):
-        send(chat_id, "⏳ la sessione è ancora in sincronizzazione dal Mac, riprova tra qualche secondo.", thread_id=thread_id)
-        return
-
-    # Ownership: sid seedato da publish/sync appartiene al Mac (owned=False) ->
-    # primo resume con --fork-session (id+file nuovi, locali); poi il fork è nostro.
-    fork = bool(sid) and not chat_state.get("owned", True)
 
     status_msg_id = send_status(chat_id, "💭 avvio…", thread_id=thread_id)
 
@@ -2352,7 +2217,7 @@ def handle(msg: dict, state: dict) -> None:
             reply, new_sid, meta = cc_live.run_live_turn(
                 tg_api,
                 prompt=prompt, session_id=sid, sdk_mode=sdk_mode, cwd=cwd,
-                model=model, effort=effort, fork=fork,
+                model=model, effort=effort, fork=False,
                 chat_id=chat_id, thread_id=thread_id, ask=ask, timeout_s=TIMEOUT,
                 context_window=context_window_for(model), warn_pct=CONTEXT_WARN_PCT,
             )
@@ -2362,16 +2227,12 @@ def handle(msg: dict, state: dict) -> None:
                 edit_status(chat_id, status_msg_id, label)
 
         with TypingPinger(chat_id, thread_id=thread_id):
-            reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort, fork=fork)
+            reply, new_sid, meta = run_claude_streaming(prompt, sid, mode, cwd, model, on_status=update_status, effort=effort, fork=False)
     chat_state["session_id"] = new_sid
-    chat_state["owned"] = True  # da qui in poi la sessione (o il suo fork) è locale
     chat_state.setdefault("cwd", cwd)
     accumulate_usage(chat_state, meta)
     if meta.get("context_tokens"):
         chat_state["last_context_tokens"] = meta["context_tokens"]
-    # sessione nuova nata qui (Telegram) → aggiungila al manifest Syncthing (sync verso il Mac)
-    if new_sid and new_sid != sid:
-        manifest_add(cwd, new_sid)
     # tieni allineato il mapping topic → sessione corrente
     if thread_id is not None:
         reg = forum_reg(state, chat_id)
