@@ -123,8 +123,11 @@ INITIAL_MTIME = BOT_PY_PATH.stat().st_mtime
 
 # Concorrenza: ogni messaggio gira su un thread separato per non bloccare il polling.
 # _active_skeys serializza richieste sullo stesso topic/chat (stessa sessione Claude).
+# _pending accoda i messaggi arrivati mentre la sessione è occupata (FIFO per skey):
+# il worker, finito il turno corrente, drena la coda invece di scartare i messaggi.
 _state_lock = threading.Lock()      # save_state atomica
 _active_skeys: set = set()
+_pending: dict = {}                 # skey -> [msg, ...] coda FIFO mentre la sessione è occupata
 _active_lock = threading.Lock()
 _executor = concurrent.futures.ThreadPoolExecutor(max_workers=20, thread_name_prefix="cc-worker")
 
@@ -2516,15 +2519,21 @@ def main() -> None:
                 skey = _msg_skey(msg)
                 with _active_lock:
                     already = skey in _active_skeys
-                    if not already:
+                    if already:
+                        # Stessa sessione ancora in elaborazione: accoda (FIFO).
+                        q = _pending.setdefault(skey, [])
+                        q.append(msg)
+                        qlen = len(q)
+                    else:
                         _active_skeys.add(skey)
 
                 if already:
-                    # Stessa sessione ancora in elaborazione: notifica e scarta.
+                    # Notifica accodamento: il messaggio sarà elaborato a turno finito.
                     try:
                         cid = msg["chat"]["id"]
                         tid = msg.get("message_thread_id")
-                        params = {"chat_id": cid, "text": "⏳ sessione occupata, riprova tra poco."}
+                        suffix = f" (#{qlen} in coda)" if qlen > 1 else ""
+                        params = {"chat_id": cid, "text": f"📥 messaggio accodato{suffix}, lo elaboro appena finisco quello in corso."}
                         if tid is not None:
                             params["message_thread_id"] = tid
                         tg("sendMessage", **params)
@@ -2534,22 +2543,32 @@ def main() -> None:
                     continue
 
                 def _worker(msg=msg, state=state, skey=skey):
-                    try:
-                        handle(msg, state)
-                    except Exception as e:
-                        log(f"handle err: {e}")
+                    cur = msg
+                    while cur is not None:
                         try:
-                            tid = msg.get("message_thread_id")
-                            params = {"chat_id": msg["chat"]["id"], "text": f"💥 errore bot: {e}"}
-                            if tid is not None:
-                                params["message_thread_id"] = tid
-                            tg("sendMessage", **params)
-                        except Exception:
-                            pass
-                    finally:
+                            handle(cur, state)
+                        except Exception as e:
+                            log(f"handle err: {e}")
+                            try:
+                                tid = cur.get("message_thread_id")
+                                params = {"chat_id": cur["chat"]["id"], "text": f"💥 errore bot: {e}"}
+                                if tid is not None:
+                                    params["message_thread_id"] = tid
+                                tg("sendMessage", **params)
+                            except Exception:
+                                pass
+                        # Drena la coda: se nel frattempo sono arrivati messaggi per
+                        # questa skey, processali in ordine; altrimenti libera la skey.
                         with _active_lock:
-                            _active_skeys.discard(skey)
-                        maybe_self_restart()
+                            q = _pending.get(skey)
+                            if q:
+                                cur = q.pop(0)
+                                if not q:
+                                    _pending.pop(skey, None)
+                            else:
+                                _active_skeys.discard(skey)
+                                cur = None
+                    maybe_self_restart()
 
                 _executor.submit(_worker)
         except KeyboardInterrupt:
