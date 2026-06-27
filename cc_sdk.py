@@ -104,6 +104,31 @@ class Turn:
         return "".join(self.text_parts)
 
 
+def _mdnest_mcp_servers() -> "dict | None":
+    """MCP server mdnest (wiki backend lgcloud) — solo se MDNEST_TOKEN è in env.
+    stdio server node; URL default = backend locale. Senza token o senza script
+    ritorna None → nessun aggancio, comportamento del bot invariato."""
+    token = os.environ.get("MDNEST_TOKEN")
+    if not token:
+        return None
+    script = os.environ.get("MDNEST_MCP_PATH") or os.path.expanduser(
+        "~/code/mdnest/mcp-server/index.js"
+    )
+    if not os.path.isfile(script):
+        return None
+    return {
+        "mdnest": {
+            "type": "stdio",
+            "command": "node",
+            "args": [script],
+            "env": {
+                "MDNEST_URL": os.environ.get("MDNEST_URL", "http://localhost:8286"),
+                "MDNEST_TOKEN": token,
+            },
+        }
+    }
+
+
 async def _drive(
     prompt: str,
     session_id: str | None,
@@ -171,6 +196,8 @@ async def _drive(
         hooks["PreCompact"] = [HookMatcher(hooks=[_pre_compact])]
     hooks = hooks or None
 
+    mcp_servers = _mdnest_mcp_servers()
+
     options = ClaudeAgentOptions(
         permission_mode=mode,                         # bypassPermissions|default|plan|acceptEdits
         resume=session_id or None,
@@ -181,6 +208,7 @@ async def _drive(
         include_partial_messages=True,                # delta streaming testo/thinking
         thinking=_thinking_config(),                  # display summarized → thinking_delta visibili
         hooks=hooks,
+        **({"mcp_servers": mcp_servers} if mcp_servers else {}),
     )
 
     deadline = time.time() + timeout_s
